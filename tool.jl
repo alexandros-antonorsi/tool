@@ -13,6 +13,7 @@ const DEFAULT_SLICE_FIELD_NAME = "θp"
 const DEFAULT_PRIME_FIELD_NAME = "θp"
 const PRIME_MEAN_DIMS = (1, 2)
 const ROUND_DIGITS = 3
+const CONTINUOUS_SLIDER_SAMPLES = 5001
 const LAST_FIGURE = Ref{Any}(nothing)
 const LAST_SCREEN = Ref{Any}(nothing)
 
@@ -415,14 +416,14 @@ function compute_prime_field(x, y, z, values; mean_dims = PRIME_MEAN_DIMS, round
     mean_volume = masked_mean(field_volume, valid_mask, mean_dims)
     prime_volume = field_volume .- mean_volume
     prime_volume[.!valid_mask] .= NaN32
-    plot_mask = valid_mask .& (field_volume .!= 0f0)
+    plot_mask = valid_mask
     plotted_prime_volume = copy(prime_volume)
     plotted_prime_volume[.!plot_mask] .= NaN32
     prime_range = symmetric_colorrange(plotted_prime_volume; fallback = (-1f0, 1f0))
     residual_value = prime_residual(prime_volume, valid_mask, mean_dims)
     default_mask = count(identity, plot_mask) > 0 ? plot_mask : valid_mask
-    x0, y0, _ = default_valid_slice_indices(default_mask)
-    z0 = count(identity, plot_mask) > 0 ? most_informative_z_index(plotted_prime_volume, plot_mask) : default_valid_slice_indices(default_mask)[3]
+    x0_index, y0_index, _ = default_valid_slice_indices(default_mask)
+    z0_index = count(identity, plot_mask) > 0 ? most_informative_z_index(plotted_prime_volume, plot_mask) : default_valid_slice_indices(default_mask)[3]
 
     return (
         xgrid = xgrid,
@@ -431,9 +432,9 @@ function compute_prime_field(x, y, z, values; mean_dims = PRIME_MEAN_DIMS, round
         plotted_prime_volume = plotted_prime_volume,
         prime_range = prime_range,
         residual_value = residual_value,
-        x0 = Int(x0),
-        y0 = Int(y0),
-        z0 = Int(z0),
+        x0 = Float64(xgrid[Int(x0_index)]),
+        y0 = Float64(ygrid[Int(y0_index)]),
+        z0 = Float64(zgrid[Int(z0_index)]),
     )
 end
 
@@ -442,13 +443,117 @@ function compute_prime_field(vtu_path, field_name; mean_dims = PRIME_MEAN_DIMS, 
     return compute_prime_field(x, y, z, values; mean_dims = mean_dims, round_digits = round_digits)
 end
 
+function slider_range(grid; samples = CONTINUOUS_SLIDER_SAMPLES)
+    lo = Float64(first(grid))
+    hi = Float64(last(grid))
+    lo == hi && return [lo]
+    return LinRange(lo, hi, max(2, samples))
+end
+
+function interpolation_bracket(grid, value)
+    v = Float64(value)
+    if v <= first(grid)
+        return 1, 1, 0f0
+    elseif v >= last(grid)
+        last_index = length(grid)
+        return last_index, last_index, 0f0
+    end
+
+    hi = searchsortedfirst(grid, v)
+    if hi <= length(grid) && grid[hi] == v
+        return hi, hi, 0f0
+    end
+
+    lo = max(1, hi - 1)
+    hi = min(length(grid), hi)
+    denom = Float32(grid[hi] - grid[lo])
+    weight = denom == 0f0 ? 0f0 : Float32((v - grid[lo]) / denom)
+    return lo, hi, clamp(weight, 0f0, 1f0)
+end
+
+function interpolated_plane(low_plane, high_plane, weight::Float32)
+    if weight == 0f0
+        return fill_missing_slice(low_plane)
+    end
+
+    result = Array{Float32}(undef, size(low_plane))
+    low_weight = 1f0 - weight
+    @inbounds for i in eachindex(result)
+        low_value = Float32(low_plane[i])
+        high_value = Float32(high_plane[i])
+        if isfinite(low_value) && isfinite(high_value)
+            result[i] = low_weight * low_value + weight * high_value
+        elseif isfinite(low_value) && !isfinite(high_value)
+            result[i] = low_value
+        elseif !isfinite(low_value) && isfinite(high_value)
+            result[i] = high_value
+        else
+            result[i] = NaN32
+        end
+    end
+    return fill_missing_slice(result)
+end
+
+function fill_missing_slice(slice)
+    result = Float32.(slice)
+    any(isnan, result) || return result
+
+    max_passes = sum(size(result))
+    for _ in 1:max_passes
+        source = copy(result)
+        changed = false
+
+        @inbounds for i in axes(result, 1), j in axes(result, 2)
+            isnan(source[i, j]) || continue
+
+            total = 0f0
+            count = 0
+            for (di, dj) in ((-1, 0), (1, 0), (0, -1), (0, 1))
+                ni = i + di
+                nj = j + dj
+                if checkbounds(Bool, source, ni, nj)
+                    value = source[ni, nj]
+                    if isfinite(value)
+                        total += value
+                        count += 1
+                    end
+                end
+            end
+
+            if count > 0
+                result[i, j] = total / Float32(count)
+                changed = true
+            end
+        end
+
+        changed || break
+        any(isnan, result) || break
+    end
+
+    return result
+end
+
 function volume_slice(volume, plane::Symbol, ix::Int, iy::Int, iz::Int)
     if plane == :xy
-        return copy(@view volume[:, :, iz])
+        return fill_missing_slice(@view volume[:, :, iz])
     elseif plane == :yz
-        return copy(@view volume[ix, :, :])
+        return fill_missing_slice(@view volume[ix, :, :])
     elseif plane == :xz
-        return copy(@view volume[:, iy, :])
+        return fill_missing_slice(@view volume[:, iy, :])
+    end
+    error("Unsupported slice plane $(plane).")
+end
+
+function volume_slice(volume, plane::Symbol, xgrid, ygrid, zgrid, x_value, y_value, z_value)
+    if plane == :xy
+        lo, hi, weight = interpolation_bracket(zgrid, z_value)
+        return interpolated_plane(@view(volume[:, :, lo]), @view(volume[:, :, hi]), weight)
+    elseif plane == :yz
+        lo, hi, weight = interpolation_bracket(xgrid, x_value)
+        return interpolated_plane(@view(volume[lo, :, :]), @view(volume[hi, :, :]), weight)
+    elseif plane == :xz
+        lo, hi, weight = interpolation_bracket(ygrid, y_value)
+        return interpolated_plane(@view(volume[:, lo, :]), @view(volume[:, hi, :]), weight)
     end
     error("Unsupported slice plane $(plane).")
 end
@@ -485,11 +590,35 @@ function field_colormap_and_range(array; fallback = (-1f0, 1f0))
 
     lo = Float32(minimum(values))
     hi = Float32(maximum(values))
+    return field_colormap_and_range(lo, hi)
+end
+
+function field_colormap_and_range(lo::Real, hi::Real; fallback = (-1f0, 1f0))
+    isfinite(lo) && isfinite(hi) || return :viridis, fallback
+    lo = Float32(lo)
+    hi = Float32(hi)
     if lo < 0f0 < hi
         bound = max(abs(lo), abs(hi), eps(Float32))
         return :balance, (-bound, bound)
     end
     return :viridis, nonsingular_colorrange(lo, hi)
+end
+
+function global_field_colormap_and_range(snapshots, field_name)
+    lo = Inf32
+    hi = -Inf32
+
+    for snapshot in snapshots
+        values = snapshot.fields[field_name]
+        finite_snapshot_values = values[isfinite.(values)]
+        isempty(finite_snapshot_values) && continue
+
+        lo = min(lo, Float32(minimum(finite_snapshot_values)))
+        hi = max(hi, Float32(maximum(finite_snapshot_values)))
+    end
+
+    lo == Inf32 && return :viridis, (-1f0, 1f0)
+    return field_colormap_and_range(lo, hi)
 end
 
 function default_valid_slice_indices(valid_mask)
@@ -813,22 +942,53 @@ function main(;
     x = snapshot_series.x
     y = snapshot_series.y
     z = snapshot_series.z
-    base_fields = snapshot_series.base_snapshot.fields
+    snapshots = snapshot_series.snapshots
+    default_snapshot_index = 1
+    default_snapshot = snapshots[default_snapshot_index]
     xgrid, ygrid, zgrid, cloud_frames = build_cloud_frames(snapshot_series; field_name = DEFAULT_VOLUME_FIELD_NAME, round_digits = ROUND_DIGITS)
     default_cloud_frame = first(cloud_frames)
 
     prime_field_names = snapshot_series.field_names
     default_prime_field_name = DEFAULT_PRIME_FIELD_NAME in prime_field_names ? DEFAULT_PRIME_FIELD_NAME : first(prime_field_names)
+    field_style_by_field = Dict(
+        field_name => global_field_colormap_and_range(snapshots, field_name)
+        for field_name in prime_field_names
+    )
 
     if display_figure
         println("Precomputing variable' fields for $(length(prime_field_names)) point-data variables...")
     end
 
-    prime_data_by_field = Dict{String, Any}()
-    for field_name in prime_field_names
-        values = base_fields[field_name]
-        prime_data_by_field[field_name] = compute_prime_field(x, y, z, values; mean_dims = PRIME_MEAN_DIMS, round_digits = ROUND_DIGITS)
+    prime_data_cache = Dict{Tuple{String, Int}, Any}()
+    prime_range_cache = Dict{String, Tuple{Float32, Float32}}()
+
+    function get_prime_data(field_name, snapshot_index::Int)
+        key = (field_name, snapshot_index)
+        return get!(prime_data_cache, key) do
+            snapshot = snapshots[snapshot_index]
+            compute_prime_field(x, y, z, snapshot.fields[field_name]; mean_dims = PRIME_MEAN_DIMS, round_digits = ROUND_DIGITS)
+        end
     end
+
+    function get_prime_colorrange(field_name)
+        return get!(prime_range_cache, field_name) do
+            hi = 0f0
+            for snapshot_index in eachindex(snapshots)
+                prime_data = get_prime_data(field_name, snapshot_index)
+                values = prime_data.plotted_prime_volume[.!isnan.(prime_data.plotted_prime_volume)]
+                isempty(values) && continue
+                hi = max(hi, Float32(maximum(abs.(values))))
+            end
+
+            hi = max(hi, eps(Float32))
+            (-hi, hi)
+        end
+    end
+
+    for field_name in prime_field_names
+        get_prime_data(field_name, default_snapshot_index)
+    end
+    get_prime_colorrange(default_prime_field_name)
     if display_figure
         println("Finished precomputing variable' fields.")
         println("Precomputing time-averaged 2D profiles for $(length(prime_field_names)) point-data variables in 3 directions...")
@@ -851,7 +1011,7 @@ function main(;
         )
     end
 
-    default_prime_data = prime_data_by_field[default_prime_field_name]
+    default_prime_data = get_prime_data(default_prime_field_name, default_snapshot_index)
     default_slice_field_name = DEFAULT_SLICE_FIELD_NAME in prime_field_names ? DEFAULT_SLICE_FIELD_NAME : first(prime_field_names)
     velocity_stress_data = compute_velocity_stress_profiles(snapshot_series; mean_dims = PRIME_MEAN_DIMS, round_digits = ROUND_DIGITS)
 
@@ -997,33 +1157,14 @@ function main(;
     rowsize!(cloud_panel, 2, Fixed(42))
     rowsize!(cloud_panel, 3, Fixed(24))
 
-    function build_slice_field_data(field_name)
-        values = base_fields[field_name]
+    function build_slice_field_data(field_name, snapshot_index::Int)
+        snapshot = snapshots[snapshot_index]
+        values = snapshot.fields[field_name]
         sxgrid, sygrid, szgrid, field_volume, valid_mask = point_values_to_masked_volume(x, y, z, values; round_digits = ROUND_DIGITS)
         plotted_volume = copy(field_volume)
-
-        shown_values = plotted_volume[.!isnan.(plotted_volume)]
-        has_shown_values = !isempty(shown_values)
-
-        if has_shown_values
-            lo = Float32(minimum(shown_values))
-            hi = Float32(maximum(shown_values))
-        else
-            lo = -1f0
-            hi = 1f0
-        end
-
-        if has_shown_values && lo < 0f0 < hi
-            bound = max(abs(lo), abs(hi), eps(Float32))
-            colorrange = (-bound, bound)
-            colormap = :balance
-        else
-            colorrange = nonsingular_colorrange(lo, hi)
-            colormap = :viridis
-        end
-
-        display_mask = has_shown_values ? .!isnan.(plotted_volume) : valid_mask
-        x0, y0, z0 = default_valid_slice_indices(display_mask)
+        colormap, colorrange = field_style_by_field[field_name]
+        display_mask = valid_mask
+        x0_index, y0_index, z0_index = default_valid_slice_indices(display_mask)
         return (
             xgrid = sxgrid,
             ygrid = sygrid,
@@ -1031,19 +1172,21 @@ function main(;
             plotted_volume = plotted_volume,
             colorrange = colorrange,
             colormap = colormap,
-            x0 = Int(x0),
-            y0 = Int(y0),
-            z0 = Int(z0),
+            x0 = Float64(sxgrid[Int(x0_index)]),
+            y0 = Float64(sygrid[Int(y0_index)]),
+            z0 = Float64(szgrid[Int(z0_index)]),
+            time = snapshot.time,
         )
     end
 
-    default_slice_data = build_slice_field_data(default_slice_field_name)
+    default_slice_data = build_slice_field_data(default_slice_field_name, default_snapshot_index)
 
     selected_slice_field = Observable(default_slice_field_name)
+    slice_snapshot_index = Observable(default_snapshot_index)
     selected_slice_data = Observable(default_slice_data)
-    x_index = Observable(Int(default_slice_data.x0))
-    y_index = Observable(Int(default_slice_data.y0))
-    z_index = Observable(Int(default_slice_data.z0))
+    x_value = Observable(Float64(default_slice_data.x0))
+    y_value = Observable(Float64(default_slice_data.y0))
+    z_value = Observable(Float64(default_slice_data.z0))
     slice_plane = Observable(:xy)
 
     ax_slice = Axis(
@@ -1075,15 +1218,8 @@ function main(;
     slice_ycoords = lift(slice_plane, selected_slice_data) do plane, slice_data
         plane == :xy ? slice_data.ygrid : slice_data.zgrid
     end
-    slice_data = lift(slice_plane, selected_slice_data, x_index, y_index, z_index) do plane, slice_data, ix, iy, iz
-        if plane == :xy
-            s = copy(@view slice_data.plotted_volume[:, :, Int(iz)])
-        elseif plane == :yz
-            s = copy(@view slice_data.plotted_volume[Int(ix), :, :])
-        else
-            s = copy(@view slice_data.plotted_volume[:, Int(iy), :])
-        end
-        s
+    slice_data = lift(slice_plane, selected_slice_data, x_value, y_value, z_value) do plane, slice_data, xv, yv, zv
+        volume_slice(slice_data.plotted_volume, plane, slice_data.xgrid, slice_data.ygrid, slice_data.zgrid, xv, yv, zv)
     end
     slice_colormap = lift(selected_slice_data) do slice_data
         slice_data.colormap
@@ -1111,10 +1247,11 @@ function main(;
     colsize!(prime_slice_panel, 1, Relative(1))
 
     selected_prime_field = Observable(default_prime_field_name)
+    prime_snapshot_index = Observable(default_snapshot_index)
     selected_prime_data = Observable(default_prime_data)
-    prime_x_index = Observable(Int(default_prime_data.x0))
-    prime_y_index = Observable(Int(default_prime_data.y0))
-    prime_z_index = Observable(Int(default_prime_data.z0))
+    prime_x_value = Observable(Float64(default_prime_data.x0))
+    prime_y_value = Observable(Float64(default_prime_data.y0))
+    prime_z_value = Observable(Float64(default_prime_data.z0))
     prime_slice_plane = Observable(:xy)
 
     prime_slice_xcoords = lift(prime_slice_plane, selected_prime_data) do plane, prime_data
@@ -1123,11 +1260,11 @@ function main(;
     prime_slice_ycoords = lift(prime_slice_plane, selected_prime_data) do plane, prime_data
         plane == :xy ? prime_data.ygrid : prime_data.zgrid
     end
-    prime_slice_data = lift(prime_slice_plane, selected_prime_data, prime_x_index, prime_y_index, prime_z_index) do plane, prime_data, ix, iy, iz
-        volume_slice(prime_data.plotted_prime_volume, plane, Int(ix), Int(iy), Int(iz))
+    prime_slice_data = lift(prime_slice_plane, selected_prime_data, prime_x_value, prime_y_value, prime_z_value) do plane, prime_data, xv, yv, zv
+        volume_slice(prime_data.plotted_prime_volume, plane, prime_data.xgrid, prime_data.ygrid, prime_data.zgrid, xv, yv, zv)
     end
-    prime_colorrange = lift(selected_prime_data) do prime_data
-        prime_data.prime_range
+    prime_colorrange = lift(selected_prime_field) do field_name
+        get_prime_colorrange(field_name)
     end
 
     ax_prime = Axis(
@@ -1300,35 +1437,47 @@ function main(;
         width = 360,
     )
 
-    plane_caption = Label(slice_controls[2, 1], "Slice plane:", color = :black)
-    btn_xy = Button(slice_controls[2, 2], label = "XY (fix z)")
-    btn_yz = Button(slice_controls[2, 3], label = "YZ (fix x)")
-    btn_xz = Button(slice_controls[2, 4], label = "XZ (fix y)")
-
-    z_caption = Label(slice_controls[3, 1], "Z slice:", color = :black)
-    z_slider = Slider(slice_controls[3, 2:3], range = 1:length(default_slice_data.zgrid), startvalue = default_slice_data.z0, width = 700, snap = true)
-    z_text = Label(slice_controls[3, 4], lift(selected_slice_data, z_index) do slice_data, iz
-        "z = $(round(slice_data.zgrid[Int(iz)], digits = 2)) m"
+    slice_time_caption = Label(slice_controls[2, 1], "Time step:", color = :black)
+    slice_time_slider = Slider(
+        slice_controls[2, 2:3],
+        range = 0:(length(snapshots) - 1),
+        startvalue = 0,
+        width = 700,
+        snap = true,
+    )
+    slice_time_text = Label(slice_controls[2, 4], lift(slice_snapshot_index) do idx
+        time_label(snapshots[idx].time)
     end, color = :black)
 
-    x_caption = Label(slice_controls[4, 1], "X slice:", color = :black)
-    x_slider = Slider(slice_controls[4, 2:3], range = 1:length(default_slice_data.xgrid), startvalue = default_slice_data.x0, width = 700, snap = true)
-    x_text = Label(slice_controls[4, 4], lift(selected_slice_data, x_index) do slice_data, ix
-        "x = $(round(slice_data.xgrid[Int(ix)], digits = 2)) m"
+    plane_caption = Label(slice_controls[3, 1], "Slice plane:", color = :black)
+    btn_xy = Button(slice_controls[3, 2], label = "XY (fix z)")
+    btn_yz = Button(slice_controls[3, 3], label = "YZ (fix x)")
+    btn_xz = Button(slice_controls[3, 4], label = "XZ (fix y)")
+
+    z_caption = Label(slice_controls[4, 1], "Z slice:", color = :black)
+    z_slider = Slider(slice_controls[4, 2:3], range = slider_range(default_slice_data.zgrid), startvalue = default_slice_data.z0, width = 700, snap = false)
+    z_text = Label(slice_controls[4, 4], lift(z_value) do zv
+        "z = $(round(zv, digits = 2)) m"
     end, color = :black)
 
-    y_caption = Label(slice_controls[5, 1], "Y slice:", color = :black)
-    y_slider = Slider(slice_controls[5, 2:3], range = 1:length(default_slice_data.ygrid), startvalue = default_slice_data.y0, width = 700, snap = true)
-    y_text = Label(slice_controls[5, 4], lift(selected_slice_data, y_index) do slice_data, iy
-        "y = $(round(slice_data.ygrid[Int(iy)], digits = 2)) m"
+    x_caption = Label(slice_controls[5, 1], "X slice:", color = :black)
+    x_slider = Slider(slice_controls[5, 2:3], range = slider_range(default_slice_data.xgrid), startvalue = default_slice_data.x0, width = 700, snap = false)
+    x_text = Label(slice_controls[5, 4], lift(x_value) do xv
+        "x = $(round(xv, digits = 2)) m"
     end, color = :black)
 
-    slice_info_text = lift(selected_slice_field, slice_plane, selected_slice_data, x_index, y_index, z_index) do field_name, plane, slice_data, ix, iy, iz
+    y_caption = Label(slice_controls[6, 1], "Y slice:", color = :black)
+    y_slider = Slider(slice_controls[6, 2:3], range = slider_range(default_slice_data.ygrid), startvalue = default_slice_data.y0, width = 700, snap = false)
+    y_text = Label(slice_controls[6, 4], lift(y_value) do yv
+        "y = $(round(yv, digits = 2)) m"
+    end, color = :black)
+
+    slice_info_text = lift(selected_slice_field, slice_plane, selected_slice_data, x_value, y_value, z_value) do field_name, plane, slice_data, xv, yv, zv
         plane_id = plane_name(plane)
-        slice = volume_slice(slice_data.plotted_volume, plane, Int(ix), Int(iy), Int(iz))
+        slice = volume_slice(slice_data.plotted_volume, plane, slice_data.xgrid, slice_data.ygrid, slice_data.zgrid, xv, yv, zv)
         "$(field_name) on " * plane_id * " slice   " * matrix_stats(slice)
     end
-    slice_info = Label(slice_controls[6, 2:4], slice_info_text, color = :black)
+    slice_info = Label(slice_controls[7, 2:4], slice_info_text, color = :black)
 
     prime_controls = GridLayout(root_layout[4, 1])
     colgap!(prime_controls, 10)
@@ -1346,42 +1495,53 @@ function main(;
         default = default_prime_field_name,
         width = 360,
     )
+    prime_time_caption = Label(prime_controls[2, 1], "Time step:", color = :black)
+    prime_time_slider = Slider(
+        prime_controls[2, 2:3],
+        range = 0:(length(snapshots) - 1),
+        startvalue = 0,
+        width = 560,
+        snap = true,
+    )
+    prime_time_text = Label(prime_controls[2, 4], lift(prime_snapshot_index) do idx
+        time_label(snapshots[idx].time)
+    end, color = :black)
     prime_formula = Label(
-        prime_controls[2, 1:4],
-        lift(selected_prime_field, selected_prime_data) do field_name, prime_data
-            prime_formula_text(field_name, prime_data.residual_value, snapshot_series.source_name)
+        prime_controls[3, 1:4],
+        lift(selected_prime_field, selected_prime_data, prime_snapshot_index) do field_name, prime_data, idx
+            prime_formula_text(field_name, prime_data.residual_value, "$(snapshot_series.source_name), $(time_label(snapshots[idx].time))")
         end,
         color = :black,
     )
-    prime_plane_caption = Label(prime_controls[3, 1], "Prime slice plane:", color = :black)
-    btn_prime_xy = Button(prime_controls[3, 2], label = "XY (fix z)")
-    btn_prime_yz = Button(prime_controls[3, 3], label = "YZ (fix x)")
-    btn_prime_xz = Button(prime_controls[3, 4], label = "XZ (fix y)")
+    prime_plane_caption = Label(prime_controls[4, 1], "Prime slice plane:", color = :black)
+    btn_prime_xy = Button(prime_controls[4, 2], label = "XY (fix z)")
+    btn_prime_yz = Button(prime_controls[4, 3], label = "YZ (fix x)")
+    btn_prime_xz = Button(prime_controls[4, 4], label = "XZ (fix y)")
 
-    prime_z_caption = Label(prime_controls[4, 1], "Prime Z slice:", color = :black)
-    prime_z_slider = Slider(prime_controls[4, 2:3], range = 1:length(default_prime_data.zgrid), startvalue = default_prime_data.z0, width = 560, snap = true)
-    prime_z_text = Label(prime_controls[4, 4], lift(selected_prime_data, prime_z_index) do prime_data, iz
-        "z = $(round(prime_data.zgrid[Int(iz)], digits = 2)) m"
+    prime_z_caption = Label(prime_controls[5, 1], "Prime Z slice:", color = :black)
+    prime_z_slider = Slider(prime_controls[5, 2:3], range = slider_range(default_prime_data.zgrid), startvalue = default_prime_data.z0, width = 560, snap = false)
+    prime_z_text = Label(prime_controls[5, 4], lift(prime_z_value) do zv
+        "z = $(round(zv, digits = 2)) m"
     end, color = :black)
 
-    prime_x_caption = Label(prime_controls[5, 1], "Prime X slice:", color = :black)
-    prime_x_slider = Slider(prime_controls[5, 2:3], range = 1:length(default_prime_data.xgrid), startvalue = default_prime_data.x0, width = 560, snap = true)
-    prime_x_text = Label(prime_controls[5, 4], lift(selected_prime_data, prime_x_index) do prime_data, ix
-        "x = $(round(prime_data.xgrid[Int(ix)], digits = 2)) m"
+    prime_x_caption = Label(prime_controls[6, 1], "Prime X slice:", color = :black)
+    prime_x_slider = Slider(prime_controls[6, 2:3], range = slider_range(default_prime_data.xgrid), startvalue = default_prime_data.x0, width = 560, snap = false)
+    prime_x_text = Label(prime_controls[6, 4], lift(prime_x_value) do xv
+        "x = $(round(xv, digits = 2)) m"
     end, color = :black)
 
-    prime_y_caption = Label(prime_controls[6, 1], "Prime Y slice:", color = :black)
-    prime_y_slider = Slider(prime_controls[6, 2:3], range = 1:length(default_prime_data.ygrid), startvalue = default_prime_data.y0, width = 560, snap = true)
-    prime_y_text = Label(prime_controls[6, 4], lift(selected_prime_data, prime_y_index) do prime_data, iy
-        "y = $(round(prime_data.ygrid[Int(iy)], digits = 2)) m"
+    prime_y_caption = Label(prime_controls[7, 1], "Prime Y slice:", color = :black)
+    prime_y_slider = Slider(prime_controls[7, 2:3], range = slider_range(default_prime_data.ygrid), startvalue = default_prime_data.y0, width = 560, snap = false)
+    prime_y_text = Label(prime_controls[7, 4], lift(prime_y_value) do yv
+        "y = $(round(yv, digits = 2)) m"
     end, color = :black)
 
-    prime_info_text = lift(selected_prime_field, prime_slice_plane, selected_prime_data, prime_x_index, prime_y_index, prime_z_index) do field_name, plane, prime_data, ix, iy, iz
+    prime_info_text = lift(selected_prime_field, prime_slice_plane, selected_prime_data, prime_x_value, prime_y_value, prime_z_value) do field_name, plane, prime_data, xv, yv, zv
         plane_id = plane_name(plane)
-        slice = volume_slice(prime_data.plotted_prime_volume, plane, Int(ix), Int(iy), Int(iz))
+        slice = volume_slice(prime_data.plotted_prime_volume, plane, prime_data.xgrid, prime_data.ygrid, prime_data.zgrid, xv, yv, zv)
         "$(prime_field_label(field_name)) on " * plane_id * " slice   " * matrix_stats(slice)
     end
-    prime_info = Label(prime_controls[7, 2:4], prime_info_text, color = :black)
+    prime_info = Label(prime_controls[8, 2:4], prime_info_text, color = :black)
 
     average_profile_controls = GridLayout(root_layout[5, 1])
     colgap!(average_profile_controls, 10)
@@ -1406,7 +1566,7 @@ function main(;
     rowsize!(root_layout, 5, Fixed(0))
 
     on(z_slider.value) do v
-        z_index[] = Int(v)
+        z_value[] = Float64(v)
     end
     on(cloud_time_slider.value) do v
         cloud_frame = cloud_frames[Int(v) + 1]
@@ -1414,18 +1574,28 @@ function main(;
         ax3d.title[] = volume_axis_title(DEFAULT_VOLUME_FIELD_NAME, cloud_frame.time)
     end
     on(x_slider.value) do v
-        x_index[] = Int(v)
+        x_value[] = Float64(v)
     end
     on(y_slider.value) do v
-        y_index[] = Int(v)
+        y_value[] = Float64(v)
+    end
+    on(slice_time_slider.value) do v
+        idx = Int(v) + 1
+        slice_snapshot_index[] = idx
+        slice_data = build_slice_field_data(selected_slice_field[], idx)
+        selected_slice_data[] = slice_data
+        set_slice_plane!(slice_plane[])
     end
     on(slice_field_menu.selection) do field_name
         isnothing(field_name) && return
 
-        slice_data = build_slice_field_data(field_name)
+        slice_data = build_slice_field_data(field_name, slice_snapshot_index[])
         selected_slice_field[] = field_name
         selected_slice_data[] = slice_data
 
+        x_slider.range[] = slider_range(slice_data.xgrid)
+        y_slider.range[] = slider_range(slice_data.ygrid)
+        z_slider.range[] = slider_range(slice_data.zgrid)
         set_close_to!(x_slider, slice_data.x0)
         set_close_to!(y_slider, slice_data.y0)
         set_close_to!(z_slider, slice_data.z0)
@@ -1433,21 +1603,31 @@ function main(;
     end
 
     on(prime_z_slider.value) do v
-        prime_z_index[] = Int(v)
+        prime_z_value[] = Float64(v)
     end
     on(prime_x_slider.value) do v
-        prime_x_index[] = Int(v)
+        prime_x_value[] = Float64(v)
     end
     on(prime_y_slider.value) do v
-        prime_y_index[] = Int(v)
+        prime_y_value[] = Float64(v)
+    end
+    on(prime_time_slider.value) do v
+        idx = Int(v) + 1
+        prime_snapshot_index[] = idx
+        prime_data = get_prime_data(selected_prime_field[], idx)
+        selected_prime_data[] = prime_data
+        set_prime_slice_plane!(prime_slice_plane[])
     end
     on(prime_field_menu.selection) do field_name
         isnothing(field_name) && return
 
-        prime_data = prime_data_by_field[field_name]
+        prime_data = get_prime_data(field_name, prime_snapshot_index[])
         selected_prime_field[] = field_name
         selected_prime_data[] = prime_data
 
+        prime_x_slider.range[] = slider_range(prime_data.xgrid)
+        prime_y_slider.range[] = slider_range(prime_data.ygrid)
+        prime_z_slider.range[] = slider_range(prime_data.zgrid)
         set_close_to!(prime_x_slider, prime_data.x0)
         set_close_to!(prime_y_slider, prime_data.y0)
         set_close_to!(prime_z_slider, prime_data.z0)
@@ -1473,6 +1653,9 @@ function main(;
 
         slice_field_caption.visible[] = show_controls
         slice_field_menu.blockscene.visible[] = show_controls
+        slice_time_caption.visible[] = show_controls
+        slice_time_slider.blockscene.visible[] = show_controls
+        slice_time_text.visible[] = show_controls
         plane_caption.visible[] = show_controls
         btn_xy.blockscene.visible[] = show_controls
         btn_yz.blockscene.visible[] = show_controls
@@ -1491,10 +1674,11 @@ function main(;
 
         rowsize!(slice_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
         rowsize!(slice_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 3, is_xy ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 4, is_yz ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 5, is_xz ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 6, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(slice_controls, 3, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(slice_controls, 4, is_xy ? Auto(0.12) : Fixed(0))
+        rowsize!(slice_controls, 5, is_yz ? Auto(0.12) : Fixed(0))
+        rowsize!(slice_controls, 6, is_xz ? Auto(0.12) : Fixed(0))
+        rowsize!(slice_controls, 7, show_controls ? Auto(0.12) : Fixed(0))
     end
 
     function set_prime_controls_visibility!(show_controls::Bool)
@@ -1504,6 +1688,9 @@ function main(;
 
         prime_field_caption.visible[] = show_controls
         prime_field_menu.blockscene.visible[] = show_controls
+        prime_time_caption.visible[] = show_controls
+        prime_time_slider.blockscene.visible[] = show_controls
+        prime_time_text.visible[] = show_controls
         prime_formula.visible[] = show_controls
         prime_plane_caption.visible[] = show_controls
         btn_prime_xy.blockscene.visible[] = show_controls
@@ -1524,10 +1711,11 @@ function main(;
         rowsize!(prime_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
         rowsize!(prime_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
         rowsize!(prime_controls, 3, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 4, is_xy ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 5, is_yz ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 6, is_xz ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 7, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(prime_controls, 4, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(prime_controls, 5, is_xy ? Auto(0.12) : Fixed(0))
+        rowsize!(prime_controls, 6, is_yz ? Auto(0.12) : Fixed(0))
+        rowsize!(prime_controls, 7, is_xz ? Auto(0.12) : Fixed(0))
+        rowsize!(prime_controls, 8, show_controls ? Auto(0.12) : Fixed(0))
     end
 
     function set_average_profile_controls_visibility!(show_controls::Bool)
@@ -1686,13 +1874,13 @@ function main(;
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
         elseif show_slice
-            rowsize!(root_layout, 3, Auto(0.10))
+            rowsize!(root_layout, 3, Auto(0.16))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
             set_slice_plane!(slice_plane[])
         elseif show_prime
             rowsize!(root_layout, 3, Fixed(0))
-            rowsize!(root_layout, 4, Auto(0.10))
+            rowsize!(root_layout, 4, Auto(0.18))
             rowsize!(root_layout, 5, Fixed(0))
             set_prime_slice_plane!(prime_slice_plane[])
         elseif show_average_profile
