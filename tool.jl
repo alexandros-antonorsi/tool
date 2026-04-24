@@ -14,6 +14,14 @@ const DEFAULT_PRIME_FIELD_NAME = "θp"
 const PRIME_MEAN_DIMS = (1, 2)
 const ROUND_DIGITS = 3
 const CONTINUOUS_SLIDER_SAMPLES = 5001
+const RENDER_VARIABLE_COLORS = Dict(
+    "ρ" => RGBf(0.95, 0.67, 0.16),
+    "u" => RGBf(0.12, 0.47, 0.92),
+    "v" => RGBf(0.23, 0.70, 0.31),
+    "w" => RGBf(0.85, 0.22, 0.24),
+    "θ" => RGBf(0.92, 0.78, 0.20),
+    "θp" => RGBf(0.64, 0.32, 0.88),
+)
 const LAST_FIGURE = Ref{Any}(nothing)
 const LAST_SCREEN = Ref{Any}(nothing)
 
@@ -42,10 +50,16 @@ struct CloudFrame
     q_hi::Float32
 end
 
+function rounded_grid_coordinates(values; round_digits = 3)
+    coords = round.(Float64.(values), digits = round_digits)
+    coords[coords .== 0.0] .= 0.0
+    return coords
+end
+
 function point_grid_lookup(x, y, z; round_digits = 3)
-    xr = round.(Float64.(x), digits = round_digits)
-    yr = round.(Float64.(y), digits = round_digits)
-    zr = round.(Float64.(z), digits = round_digits)
+    xr = rounded_grid_coordinates(x; round_digits = round_digits)
+    yr = rounded_grid_coordinates(y; round_digits = round_digits)
+    zr = rounded_grid_coordinates(z; round_digits = round_digits)
 
     xgrid = sort(unique(xr))
     ygrid = sort(unique(yr))
@@ -110,28 +124,42 @@ function point_values_to_masked_volume(x, y, z, values; round_digits = 3)
     return lookup.xgrid, lookup.ygrid, lookup.zgrid, volume, valid_mask
 end
 
-function cloud_render_setup(q_volume)
-    q_nonzero = q_volume[q_volume .> 0f0]
-    isempty(q_nonzero) && error("Selected volume field contains no positive values to render.")
-
-    q_lo = quantile(q_nonzero, 0.03)
-    q_hi = quantile(q_nonzero, 0.999)
-    scale = max(Float32(q_hi - q_lo), eps(Float32))
-
-    strength_raw = clamp.((q_volume .- Float32(q_lo)) ./ scale, 0f0, 1f0)
-    strength = log1p.(12f0 .* strength_raw) ./ log1p(12f0)
-    alpha = 0.92f0 .* (strength .^ 0.72f0)
-    alpha[q_volume .<= q_lo] .= 0f0
-
-    r = 0.90f0 .+ 0.10f0 .* strength
-    g = 0.91f0 .+ 0.09f0 .* strength
-    b = 0.95f0 .+ 0.05f0 .* strength
-    q_rgba = RGBAf.(r, g, b, alpha)
-
-    return Float32(q_lo), Float32(q_hi), q_rgba
+function render_variable_color(field_name)
+    return get(RENDER_VARIABLE_COLORS, field_name, RGBf(0.75, 0.75, 0.75))
 end
 
-function build_cloud_frames(snapshot_series::SnapshotSeries; field_name = DEFAULT_VOLUME_FIELD_NAME, round_digits = ROUND_DIGITS)
+function render_signal(field_volume, colorrange)
+    lo, hi = Float32.(colorrange)
+    signal = zeros(Float32, size(field_volume))
+
+    if lo < 0f0 < hi
+        scale = max(abs(lo), abs(hi), eps(Float32))
+        @inbounds for i in eachindex(signal)
+            value = field_volume[i]
+            signal[i] = isfinite(value) ? clamp(abs(Float32(value)) / scale, 0f0, 1f0) : 0f0
+        end
+    else
+        scale = max(hi - lo, eps(Float32))
+        @inbounds for i in eachindex(signal)
+            value = field_volume[i]
+            signal[i] = isfinite(value) ? clamp((Float32(value) - lo) / scale, 0f0, 1f0) : 0f0
+        end
+    end
+
+    return signal
+end
+
+function cloud_render_setup(field_volume, color, colorrange)
+    signal = render_signal(field_volume, colorrange)
+    strength = log1p.(8f0 .* signal) ./ log1p(8f0)
+    alpha = 0.48f0 .* (strength .^ 1.15f0)
+    alpha[signal .<= 0.02f0] .= 0f0
+
+    q_rgba = RGBAf.(color.r, color.g, color.b, alpha)
+    return Float32(colorrange[1]), Float32(colorrange[2]), q_rgba
+end
+
+function build_cloud_frames(snapshot_series::SnapshotSeries; field_name = DEFAULT_VOLUME_FIELD_NAME, colorrange = (-1f0, 1f0), color = render_variable_color(field_name), round_digits = ROUND_DIGITS)
     require_fields(snapshot_series.base_snapshot.fields, [field_name])
 
     snapshots = snapshot_series.snapshots
@@ -140,7 +168,7 @@ function build_cloud_frames(snapshot_series::SnapshotSeries; field_name = DEFAUL
     frame_grid = nothing
 
     for (idx, snapshot) in enumerate(snapshots)
-        xgrid_i, ygrid_i, zgrid_i, q_volume = point_values_to_volume(
+        xgrid_i, ygrid_i, zgrid_i, field_volume, _ = point_values_to_masked_volume(
             snapshot_series.x,
             snapshot_series.y,
             snapshot_series.z,
@@ -155,8 +183,8 @@ function build_cloud_frames(snapshot_series::SnapshotSeries; field_name = DEFAUL
             frame_grid.zgrid == zgrid_i || error("Cloud frame z grids are inconsistent across time steps.")
         end
 
-        q_lo, q_hi, q_rgba = cloud_render_setup(q_volume)
-        frames[idx] = CloudFrame(snapshot.time, q_volume, q_rgba, q_lo, q_hi)
+        q_lo, q_hi, q_rgba = cloud_render_setup(field_volume, color, colorrange)
+        frames[idx] = CloudFrame(snapshot.time, field_volume, q_rgba, q_lo, q_hi)
     end
 
     return frame_grid.xgrid, frame_grid.ygrid, frame_grid.zgrid, frames
@@ -379,6 +407,7 @@ function slice_axis_title(field_name, plane::Symbol)
 end
 
 volume_axis_title(field_name, time) = "$(field_name) volume, $(time_label(time))"
+render_axis_title(time) = "3D volume render, $(time_label(time))"
 prime_field_label(field_name) = "$(field_name)'"
 prime_mean_label(field_name) = "<$(field_name)>_xy(z)"
 
@@ -570,9 +599,13 @@ function finite_extrema(array)
 end
 
 function nonsingular_colorrange(lo::Float32, hi::Float32; min_pad = 1f-6)
-    if lo == hi
-        pad = max(abs(lo) * 0.05f0, min_pad)
-        return lo - pad, hi + pad
+    lo <= hi || ((lo, hi) = (hi, lo))
+
+    span = hi - lo
+    if span < min_pad
+        center = (lo + hi) / 2f0
+        pad = min_pad / 2f0
+        return center - pad, center + pad
     end
     return lo, hi
 end
@@ -944,9 +977,6 @@ function main(;
     z = snapshot_series.z
     snapshots = snapshot_series.snapshots
     default_snapshot_index = 1
-    default_snapshot = snapshots[default_snapshot_index]
-    xgrid, ygrid, zgrid, cloud_frames = build_cloud_frames(snapshot_series; field_name = DEFAULT_VOLUME_FIELD_NAME, round_digits = ROUND_DIGITS)
-    default_cloud_frame = first(cloud_frames)
 
     prime_field_names = snapshot_series.field_names
     default_prime_field_name = DEFAULT_PRIME_FIELD_NAME in prime_field_names ? DEFAULT_PRIME_FIELD_NAME : first(prime_field_names)
@@ -954,6 +984,50 @@ function main(;
         field_name => global_field_colormap_and_range(snapshots, field_name)
         for field_name in prime_field_names
     )
+    render_field_names = copy(prime_field_names)
+    default_render_field_name = DEFAULT_VOLUME_FIELD_NAME in render_field_names ? DEFAULT_VOLUME_FIELD_NAME : first(render_field_names)
+
+    if display_figure
+        println("Precomputing 3D render layers for $(length(render_field_names)) point-data variables...")
+    end
+
+    render_frame_cache = Dict{String, Vector{CloudFrame}}()
+    render_grid = Ref{Any}(nothing)
+
+    function get_render_frames(field_name)
+        return get!(render_frame_cache, field_name) do
+            _, colorrange = field_style_by_field[field_name]
+            xgrid_i, ygrid_i, zgrid_i, frames_i = build_cloud_frames(
+                snapshot_series;
+                field_name = field_name,
+                colorrange = colorrange,
+                color = render_variable_color(field_name),
+                round_digits = ROUND_DIGITS,
+            )
+
+            if isnothing(render_grid[])
+                render_grid[] = (xgrid = xgrid_i, ygrid = ygrid_i, zgrid = zgrid_i)
+            else
+                grid = render_grid[]
+                grid.xgrid == xgrid_i || error("Render layer x grids are inconsistent.")
+                grid.ygrid == ygrid_i || error("Render layer y grids are inconsistent.")
+                grid.zgrid == zgrid_i || error("Render layer z grids are inconsistent.")
+            end
+
+            frames_i
+        end
+    end
+
+    for field_name in render_field_names
+        get_render_frames(field_name)
+    end
+
+    render_grid_value = render_grid[]
+    xgrid = render_grid_value.xgrid
+    ygrid = render_grid_value.ygrid
+    zgrid = render_grid_value.zgrid
+    cloud_frames = get_render_frames(default_render_field_name)
+    default_cloud_frame = cloud_frames[default_snapshot_index]
 
     if display_figure
         println("Precomputing variable' fields for $(length(prime_field_names)) point-data variables...")
@@ -1078,14 +1152,17 @@ function main(;
     colsize!(average_profile_panel, 1, Relative(1))
     colsize!(cloud_panel, 1, Relative(1))
 
-    selected_cloud_frame = Observable(default_cloud_frame)
-    cloud_rgba = lift(selected_cloud_frame) do cloud_frame
-        cloud_frame.q_rgba
-    end
+    current_view_mode = Ref(:slice)
+    render_snapshot_index = Observable(default_snapshot_index)
+    render_rgba_by_field = Dict(
+        field_name => Observable(get_render_frames(field_name)[default_snapshot_index].q_rgba)
+        for field_name in render_field_names
+    )
+    cloud_info_text = Observable("")
 
     ax3d = Axis3(
         cloud_panel[1, 1],
-        title = volume_axis_title(DEFAULT_VOLUME_FIELD_NAME, default_cloud_frame.time),
+        title = render_axis_title(default_cloud_frame.time),
         xlabel = "x (m)",
         ylabel = "y (m)",
         zlabel = "z (m)",
@@ -1126,34 +1203,66 @@ function main(;
         shading = NoShading,
     )
 
-    cloud_plot = volume!(
-        ax3d,
-        first(xgrid)..last(xgrid),
-        first(ygrid)..last(ygrid),
-        first(zgrid)..last(zgrid),
-        cloud_rgba;
-        algorithm = :absorptionrgba,
-        absorption = 10f0,
-    )
+    render_plots_by_field = Dict{String, Any}()
+    for field_name in render_field_names
+        plot = volume!(
+            ax3d,
+            first(xgrid)..last(xgrid),
+            first(ygrid)..last(ygrid),
+            first(zgrid)..last(zgrid),
+            render_rgba_by_field[field_name];
+            algorithm = :absorptionrgba,
+            absorption = 10f0,
+        )
+        plot.visible[] = field_name == default_render_field_name
+        render_plots_by_field[field_name] = plot
+    end
     limits!(ax3d, first(xgrid), last(xgrid), first(ygrid), last(ygrid), first(zgrid), last(zgrid))
+
+    render_checklist = GridLayout(
+        cloud_panel[1, 1];
+        width = Fixed(130),
+        tellwidth = false,
+        tellheight = false,
+        halign = :right,
+        valign = :top,
+    )
+    rowgap!(render_checklist, 8)
+    colgap!(render_checklist, 8)
+    colsize!(render_checklist, 1, Fixed(24))
+    render_checklist_title = Label(render_checklist[1, 1:2], "Render variables:", color = :black, halign = :left)
+    render_checkbox_by_field = Dict{String, Any}()
+    render_checkbox_labels = Dict{String, Any}()
+    for (row, field_name) in enumerate(render_field_names)
+        checkbox = Checkbox(
+            render_checklist[row + 1, 1];
+            checked = field_name == default_render_field_name,
+        )
+        label = Label(
+            render_checklist[row + 1, 2],
+            field_name;
+            color = render_variable_color(field_name),
+            halign = :left,
+        )
+        render_checkbox_by_field[field_name] = checkbox
+        render_checkbox_labels[field_name] = label
+    end
 
     cloud_controls = GridLayout(cloud_panel[2, 1])
     colgap!(cloud_controls, 10)
     cloud_time_caption = Label(cloud_controls[1, 1], "Time step:", color = :black)
     cloud_time_slider = Slider(
         cloud_controls[1, 2],
-        range = 0:(length(cloud_frames) - 1),
+        range = 0:(length(snapshots) - 1),
         startvalue = 0,
         width = 760,
         snap = true,
     )
-    cloud_time_text = Label(cloud_controls[1, 3], lift(selected_cloud_frame) do cloud_frame
-        time_label(cloud_frame.time)
+    cloud_time_text = Label(cloud_controls[1, 3], lift(render_snapshot_index) do idx
+        time_label(snapshots[idx].time)
     end, color = :black)
-    cloud_info = Label(cloud_panel[3, 1], lift(selected_cloud_frame) do cloud_frame
-        step_kind = length(cloud_frames) == 1 ? "Snapshot" : "File timestep"
-        "$(step_kind) $(time_label(cloud_frame.time))   render range: $(round(cloud_frame.q_lo, sigdigits = 4)) to $(round(cloud_frame.q_hi, sigdigits = 4))"
-    end, color = :black)
+
+    cloud_info = Label(cloud_panel[3, 1], cloud_info_text, color = :black)
     rowsize!(cloud_panel, 2, Fixed(42))
     rowsize!(cloud_panel, 3, Fixed(24))
 
@@ -1565,13 +1674,45 @@ function main(;
     average_profile_info = Label(average_profile_controls[3, 2:4], average_profile_info_text, color = :black)
     rowsize!(root_layout, 5, Fixed(0))
 
+    function active_render_fields()
+        return [field_name for field_name in render_field_names if render_checkbox_by_field[field_name].checked[]]
+    end
+
+    function update_render_info!()
+        idx = render_snapshot_index[]
+        step_kind = length(snapshots) == 1 ? "Snapshot" : "File timestep"
+        active_fields = active_render_fields()
+        field_text = isempty(active_fields) ? "no variables selected" : "rendering: " * join(active_fields, ", ")
+        cloud_info_text[] = "$(step_kind) $(time_label(snapshots[idx].time))   $(field_text)"
+    end
+
+    function update_render_visibility!()
+        show_cloud = current_view_mode[] == :cloud
+        for field_name in render_field_names
+            render_plots_by_field[field_name].visible[] =
+                show_cloud && render_checkbox_by_field[field_name].checked[]
+        end
+    end
+
+    for field_name in render_field_names
+        on(render_checkbox_by_field[field_name].checked) do _
+            update_render_visibility!()
+            update_render_info!()
+        end
+    end
+    update_render_info!()
+
     on(z_slider.value) do v
         z_value[] = Float64(v)
     end
     on(cloud_time_slider.value) do v
-        cloud_frame = cloud_frames[Int(v) + 1]
-        selected_cloud_frame[] = cloud_frame
-        ax3d.title[] = volume_axis_title(DEFAULT_VOLUME_FIELD_NAME, cloud_frame.time)
+        idx = Int(v) + 1
+        render_snapshot_index[] = idx
+        for field_name in render_field_names
+            render_rgba_by_field[field_name][] = get_render_frames(field_name)[idx].q_rgba
+        end
+        ax3d.title[] = render_axis_title(snapshots[idx].time)
+        update_render_info!()
     end
     on(x_slider.value) do v
         x_value[] = Float64(v)
@@ -1633,14 +1774,17 @@ function main(;
         set_close_to!(prime_z_slider, prime_data.z0)
         set_prime_slice_plane!(prime_slice_plane[])
     end
-    current_view_mode = Ref(:slice)
-
     function set_cloud_controls_visibility!(show_controls::Bool)
-        cloud_plot.visible[] = show_controls
+        update_render_visibility!()
         cloud_time_caption.visible[] = show_controls
         cloud_time_slider.blockscene.visible[] = show_controls
         cloud_time_text.visible[] = show_controls
         cloud_info.visible[] = show_controls
+        render_checklist_title.visible[] = show_controls
+        for field_name in render_field_names
+            render_checkbox_by_field[field_name].blockscene.visible[] = show_controls
+            render_checkbox_labels[field_name].visible[] = show_controls
+        end
 
         rowsize!(cloud_panel, 2, show_controls ? Fixed(42) : Fixed(0))
         rowsize!(cloud_panel, 3, show_controls ? Fixed(24) : Fixed(0))
