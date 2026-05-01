@@ -14,6 +14,8 @@ const DEFAULT_PRIME_FIELD_NAME = "θp"
 const PRIME_MEAN_DIMS = (1, 2)
 const ROUND_DIGITS = 3
 const CONTINUOUS_SLIDER_SAMPLES = 5001
+const RENDER_PLAYBACK_SPEED_OPTIONS = ["1x", "2x", "4x"]
+const RENDER_PLAYBACK_INTERVAL_SECONDS = Dict("1x" => 1.0, "2x" => 0.5, "4x" => 0.25)
 const RENDER_VARIABLE_COLORS = Dict(
     "ρ" => RGBf(0.95, 0.67, 0.16),
     "u" => RGBf(0.12, 0.47, 0.92),
@@ -426,8 +428,45 @@ function prime_formula_text(field_name, residual_value, source_name)
            "max |<$(prime_field_label(field_name))>_xy(z)| = $(round(residual_value, sigdigits = 5))"
 end
 
-velocity_stress_profile_label(i, j) = "\\bar{⟨u$(i)'u$(j)'⟩}_{xy}(z)"
-velocity_stress_symbol() = "\\bar{⟨u_i' u_j'⟩}_{xy}(z)"
+velocity_component_label(i) = VELOCITY_COMPONENT_FIELD_NAMES[i]
+velocity_stress_pair_label(i, j) = "$(velocity_component_label(i))'$(velocity_component_label(j))'"
+velocity_stress_profile_label(i, j) = "⟨$(velocity_stress_pair_label(i, j))⟩_xy(z)"
+velocity_stress_symbol() = "⟨a'b'⟩_xy(z), a,b in {u,v,w}"
+
+function profile_maxabs(values)
+    isempty(values) && return 0.0
+    return maximum(abs.(Float64.(values)))
+end
+
+function zero_profile_like(profile)
+    result = zeros(Float32, length(profile))
+    result[isnan.(profile)] .= NaN32
+    return result
+end
+
+function set_profile_x_axis!(ax, values; near_zero_threshold = 1e-6)
+    isempty(values) && return
+
+    lo = Float64(minimum(values))
+    hi = Float64(maximum(values))
+    maxabs_value = profile_maxabs(values)
+
+    if maxabs_value < near_zero_threshold
+        bound = near_zero_threshold
+        xlims!(ax, -bound, bound)
+        ax.xticks[] = [0.0]
+        return
+    end
+
+    span = hi - lo
+    if span == 0.0
+        pad = max(abs(lo) * 0.05, 1e-6)
+        xlims!(ax, lo - pad, hi + pad)
+    else
+        pad = 0.05 * span
+        xlims!(ax, lo - pad, hi + pad)
+    end
+end
 
 function masked_mean(volume, valid_mask, dims)
     sums = sum(ifelse.(valid_mask, volume, 0f0), dims = dims)
@@ -1080,7 +1119,7 @@ function main(;
     if display_figure
         println("Finished precomputing time-averaged 2D profiles.")
         println(
-            "Computing time-averaged <u_i' u_j'>_xy(z) profiles using $(length(snapshot_series.snapshots)) " *
+            "Computing time-averaged <a' b'>_xy(z) profiles for a,b in {u,v,w} using $(length(snapshot_series.snapshots)) " *
             "$(length(snapshot_series.snapshots) == 1 ? "file timestep" : "file timesteps")...",
         )
     end
@@ -1113,7 +1152,7 @@ function main(;
     btn_slice = Button(toolbar[1, 3], label = "Slices")
     btn_prime = Button(toolbar[1, 4], label = "Variable'")
     btn_average_profile = Button(toolbar[1, 5], label = "2D Mean")
-    btn_velocity_stress = Button(toolbar[1, 6], label = "u_i'u_j'")
+    btn_velocity_stress = Button(toolbar[1, 6], label = "u'v'w'")
     colgap!(toolbar, 10)
 
     main_layout = GridLayout(
@@ -1261,6 +1300,14 @@ function main(;
     cloud_time_text = Label(cloud_controls[1, 3], lift(render_snapshot_index) do idx
         time_label(snapshots[idx].time)
     end, color = :black)
+    cloud_speed_caption = Label(cloud_controls[1, 4], "Speed:", color = :black)
+    cloud_speed_menu = Menu(
+        cloud_controls[1, 5],
+        options = RENDER_PLAYBACK_SPEED_OPTIONS,
+        default = first(RENDER_PLAYBACK_SPEED_OPTIONS),
+        width = 80,
+    )
+    cloud_play_button = Button(cloud_controls[1, 6], label = "Play", width = 80)
 
     cloud_info = Label(cloud_panel[3, 1], cloud_info_text, color = :black)
     rowsize!(cloud_panel, 2, Fixed(42))
@@ -1483,9 +1530,16 @@ function main(;
 
     velocity_stress_axes = Matrix{Any}(undef, 3, 3)
     velocity_stress_lines = Matrix{Any}(undef, 3, 3)
+    velocity_stress_scale = maximum(profile_maxabs(profile[.!isnan.(profile)]) for profile in velocity_stress_data.profiles)
+    velocity_stress_near_zero_threshold = max(velocity_stress_scale * 1e-8, 1e-12)
     for i in 1:3, j in 1:3
         profile = velocity_stress_data.profiles[i, j]
-        title = "u$(i)'u$(j)'"
+        finite_profile_values = profile[.!isnan.(profile)]
+        display_profile =
+            profile_maxabs(finite_profile_values) < velocity_stress_near_zero_threshold ?
+            zero_profile_like(profile) :
+            profile
+        title = velocity_stress_pair_label(i, j)
         ax = Axis(
             velocity_stress_panel[i, j],
             title = title,
@@ -1508,12 +1562,8 @@ function main(;
             ygridcolor = RGBAf(0, 0, 0, 0.10),
         )
 
-        line = lines!(ax, profile, velocity_stress_data.zgrid; color = RGBf(0.10, 0.25, 0.55), linewidth = 2)
-        finite_profile_values = profile[.!isnan.(profile)]
-        if !isempty(finite_profile_values)
-            lo, hi = nonsingular_colorrange(Float32(minimum(finite_profile_values)), Float32(maximum(finite_profile_values)))
-            xlims!(ax, lo, hi)
-        end
+        line = lines!(ax, display_profile, velocity_stress_data.zgrid; color = RGBf(0.10, 0.25, 0.55), linewidth = 2)
+        set_profile_x_axis!(ax, finite_profile_values; near_zero_threshold = velocity_stress_near_zero_threshold)
         ylims!(ax, first(velocity_stress_data.zgrid), last(velocity_stress_data.zgrid))
 
         velocity_stress_axes[i, j] = ax
@@ -1702,8 +1752,67 @@ function main(;
     end
     update_render_info!()
 
+    render_playing = Observable(false)
+    render_playback_task = Ref{Union{Task, Nothing}}(nothing)
+    render_playback_generation = Ref(0)
+
+    function render_playback_interval()
+        speed = cloud_speed_menu.selection[]
+        return get(RENDER_PLAYBACK_INTERVAL_SECONDS, speed, 1.0)
+    end
+
+    function set_render_playing!(playing::Bool)
+        render_playing[] = playing
+        cloud_play_button.label[] = playing ? "Pause" : "Play"
+    end
+
+    function advance_render_timestep!()
+        current_index = render_snapshot_index[]
+        if current_index >= length(snapshots)
+            return false
+        end
+
+        set_close_to!(cloud_time_slider, current_index)
+        return true
+    end
+
+    function stop_render_playback!()
+        render_playback_generation[] += 1
+        set_render_playing!(false)
+    end
+
+    function start_render_playback!()
+        length(snapshots) <= 1 && return
+
+        if render_snapshot_index[] >= length(snapshots)
+            set_close_to!(cloud_time_slider, 0)
+        end
+
+        render_playback_generation[] += 1
+        generation = render_playback_generation[]
+        set_render_playing!(true)
+        render_playback_task[] = @async begin
+            while render_playing[] && render_playback_generation[] == generation
+                sleep(render_playback_interval())
+                render_playing[] && render_playback_generation[] == generation || break
+                advanced = advance_render_timestep!()
+                if !advanced
+                    stop_render_playback!()
+                    break
+                end
+            end
+        end
+    end
+
     on(z_slider.value) do v
         z_value[] = Float64(v)
+    end
+    on(cloud_play_button.clicks) do _
+        if render_playing[]
+            stop_render_playback!()
+        else
+            start_render_playback!()
+        end
     end
     on(cloud_time_slider.value) do v
         idx = Int(v) + 1
@@ -1779,6 +1888,9 @@ function main(;
         cloud_time_caption.visible[] = show_controls
         cloud_time_slider.blockscene.visible[] = show_controls
         cloud_time_text.visible[] = show_controls
+        cloud_speed_caption.visible[] = show_controls
+        cloud_speed_menu.blockscene.visible[] = show_controls
+        cloud_play_button.blockscene.visible[] = show_controls
         cloud_info.visible[] = show_controls
         render_checklist_title.visible[] = show_controls
         for field_name in render_field_names
@@ -1977,6 +2089,8 @@ function main(;
         show_prime = mode == :prime
         show_average_profile = mode == :average_profile
         show_velocity_stress = mode == :velocity_stress
+
+        show_cloud || stop_render_playback!()
 
         ax3d.scene.visible[] = show_cloud
         ax3d.blockscene.visible[] = show_cloud
