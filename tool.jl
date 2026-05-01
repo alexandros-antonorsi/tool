@@ -6,6 +6,7 @@ GLMakie.activate!()
 
 const DATA_DIR = @__DIR__
 const DEFAULT_DATA_PATH = joinpath(DATA_DIR, "simulation.pvd")
+const DEFAULT_NETCDF_EXPORT_PATH = joinpath(DATA_DIR, "simulation.nc")
 const DEFAULT_FIELD_ORDER = ["ρ", "u", "v", "w", "θ", "θp"]
 const VELOCITY_COMPONENT_FIELD_NAMES = ["u", "v", "w"]
 const DEFAULT_VOLUME_FIELD_NAME = "θp"
@@ -16,6 +17,7 @@ const ROUND_DIGITS = 3
 const CONTINUOUS_SLIDER_SAMPLES = 5001
 const RENDER_PLAYBACK_SPEED_OPTIONS = ["1x", "2x", "4x"]
 const RENDER_PLAYBACK_INTERVAL_SECONDS = Dict("1x" => 1.0, "2x" => 0.5, "4x" => 0.25)
+const NETCDF_NAME_REPLACEMENTS = Dict("ρ" => "rho", "θ" => "theta", "θp" => "thetap")
 const RENDER_VARIABLE_COLORS = Dict(
     "ρ" => RGBf(0.95, 0.67, 0.16),
     "u" => RGBf(0.12, 0.47, 0.92),
@@ -51,6 +53,23 @@ struct CloudFrame
     q_lo::Float32
     q_hi::Float32
 end
+
+struct NetCDFVariableSpec
+    name::String
+    dim_ids::Vector{Int}
+    nc_type::UInt32
+    attributes::Vector{Any}
+    vsize::Int
+    begin_offset::Int
+end
+
+const NC_ZERO = UInt32(0)
+const NC_DIMENSION = UInt32(10)
+const NC_VARIABLE = UInt32(11)
+const NC_ATTRIBUTE = UInt32(12)
+const NC_CHAR = UInt32(2)
+const NC_FLOAT = UInt32(5)
+const NC_DOUBLE = UInt32(6)
 
 function rounded_grid_coordinates(values; round_digits = 3)
     coords = round.(Float64.(values), digits = round_digits)
@@ -353,6 +372,297 @@ function load_scalar_field_points(vtu_path, field_name)
     x, y, z, point_data = load_point_dataset(vtu_path)
     values = get_scalar_field_values(point_data, field_name)
     return x, y, z, values
+end
+
+function write_nc_u32(io, value::Integer)
+    x = UInt32(value)
+    write(io, UInt8((x >> 24) & 0xff))
+    write(io, UInt8((x >> 16) & 0xff))
+    write(io, UInt8((x >> 8) & 0xff))
+    write(io, UInt8(x & 0xff))
+end
+
+function write_nc_u64(io, value::UInt64)
+    write_nc_u32(io, UInt32(value >> 32))
+    write_nc_u32(io, UInt32(value & 0xffffffff))
+end
+
+function write_nc_f32(io, value)
+    write_nc_u32(io, reinterpret(UInt32, Float32(value)))
+end
+
+function write_nc_f64(io, value)
+    write_nc_u64(io, reinterpret(UInt64, Float64(value)))
+end
+
+function write_nc_padding(io, byte_count)
+    padding = mod(-byte_count, 4)
+    for _ in 1:padding
+        write(io, UInt8(0))
+    end
+end
+
+function write_nc_string(io, value)
+    text = String(value)
+    bytes = codeunits(text)
+    write_nc_u32(io, length(bytes))
+    write(io, bytes)
+    write_nc_padding(io, length(bytes))
+end
+
+function nc_type_size(nc_type::UInt32)
+    nc_type == NC_CHAR && return 1
+    nc_type == NC_FLOAT && return 4
+    nc_type == NC_DOUBLE && return 8
+    error("Unsupported NetCDF type code $(nc_type).")
+end
+
+function nc_padded_size(byte_count)
+    return byte_count + mod(-byte_count, 4)
+end
+
+function nc_attribute(name, value::AbstractString)
+    return (name = String(name), nc_type = NC_CHAR, values = String(value))
+end
+
+function nc_attribute(name, value::Float32)
+    return (name = String(name), nc_type = NC_FLOAT, values = Float32[value])
+end
+
+function nc_attribute_length(attribute)
+    attribute.nc_type == NC_CHAR && return length(codeunits(attribute.values))
+    return length(attribute.values)
+end
+
+function write_nc_attribute_values(io, attribute)
+    if attribute.nc_type == NC_CHAR
+        bytes = codeunits(attribute.values)
+        write(io, bytes)
+        write_nc_padding(io, length(bytes))
+    elseif attribute.nc_type == NC_FLOAT
+        for value in attribute.values
+            write_nc_f32(io, value)
+        end
+        write_nc_padding(io, length(attribute.values) * nc_type_size(attribute.nc_type))
+    else
+        error("Unsupported NetCDF attribute type code $(attribute.nc_type).")
+    end
+end
+
+function write_nc_attributes(io, attributes)
+    if isempty(attributes)
+        write_nc_u32(io, NC_ZERO)
+        return
+    end
+
+    write_nc_u32(io, NC_ATTRIBUTE)
+    write_nc_u32(io, length(attributes))
+    for attribute in attributes
+        write_nc_string(io, attribute.name)
+        write_nc_u32(io, attribute.nc_type)
+        write_nc_u32(io, nc_attribute_length(attribute))
+        write_nc_attribute_values(io, attribute)
+    end
+end
+
+function write_nc_header(io, dimensions, global_attributes, variables)
+    write(io, UInt8['C', 'D', 'F', 0x01])
+    write_nc_u32(io, 0)
+
+    write_nc_u32(io, NC_DIMENSION)
+    write_nc_u32(io, length(dimensions))
+    for (name, len) in dimensions
+        write_nc_string(io, name)
+        write_nc_u32(io, len)
+    end
+
+    write_nc_attributes(io, global_attributes)
+
+    write_nc_u32(io, NC_VARIABLE)
+    write_nc_u32(io, length(variables))
+    for variable in variables
+        write_nc_string(io, variable.name)
+        write_nc_u32(io, length(variable.dim_ids))
+        for dim_id in variable.dim_ids
+            write_nc_u32(io, dim_id)
+        end
+        write_nc_attributes(io, variable.attributes)
+        write_nc_u32(io, variable.nc_type)
+        write_nc_u32(io, variable.vsize)
+        write_nc_u32(io, variable.begin_offset)
+    end
+end
+
+function netcdf_ascii_name_char(c)
+    return isascii(c) && (isletter(c) || isdigit(c) || c == '_')
+end
+
+function netcdf_safe_name(field_name, used_names::Set{String})
+    base = get(NETCDF_NAME_REPLACEMENTS, field_name, nothing)
+    if isnothing(base)
+        buffer = IOBuffer()
+        for c in field_name
+            if netcdf_ascii_name_char(c)
+                print(buffer, c)
+            else
+                print(buffer, "_u", lpad(string(Int(c), base = 16), 4, '0'))
+            end
+        end
+        base = String(take!(buffer))
+    end
+
+    isempty(base) && (base = "var")
+    first_char = first(base)
+    if !(isascii(first_char) && (isletter(first_char) || first_char == '_'))
+        base = "var_" * base
+    end
+
+    candidate = base
+    suffix = 2
+    while candidate in used_names
+        candidate = "$(base)_$(suffix)"
+        suffix += 1
+    end
+    push!(used_names, candidate)
+    return candidate
+end
+
+function normalized_netcdf_output_path(path)
+    cleaned_path = strip(String(path))
+    isempty(cleaned_path) && (cleaned_path = DEFAULT_NETCDF_EXPORT_PATH)
+    output_path = isabspath(cleaned_path) ? cleaned_path : joinpath(DATA_DIR, cleaned_path)
+    splitext(output_path)[2] == "" && (output_path *= ".nc")
+    return normpath(output_path)
+end
+
+function nc_variable_size(dim_ids, dimensions, nc_type)
+    value_count = prod(Int(dimensions[dim_id + 1][2]) for dim_id in dim_ids)
+    return nc_padded_size(value_count * nc_type_size(nc_type))
+end
+
+function netcdf_variable_specs(dimensions, field_names)
+    used_names = Set(["time", "x", "y", "z"])
+    variables = NetCDFVariableSpec[
+        NetCDFVariableSpec("time", [0], NC_DOUBLE, Any[nc_attribute("units", "simulation time")], 0, 0),
+        NetCDFVariableSpec("x", [1], NC_DOUBLE, Any[nc_attribute("units", "m"), nc_attribute("axis", "X")], 0, 0),
+        NetCDFVariableSpec("y", [2], NC_DOUBLE, Any[nc_attribute("units", "m"), nc_attribute("axis", "Y")], 0, 0),
+        NetCDFVariableSpec("z", [3], NC_DOUBLE, Any[nc_attribute("units", "m"), nc_attribute("axis", "Z")], 0, 0),
+    ]
+    field_name_map = Pair{String, String}[]
+
+    for field_name in field_names
+        nc_name = netcdf_safe_name(field_name, used_names)
+        push!(field_name_map, field_name => nc_name)
+        push!(variables, NetCDFVariableSpec(
+            nc_name,
+            [0, 3, 2, 1],
+            NC_FLOAT,
+            Any[
+                nc_attribute("original_name", field_name),
+                nc_attribute("_FillValue", NaN32),
+            ],
+            0,
+            0,
+        ))
+    end
+
+    sized_variables = NetCDFVariableSpec[
+        NetCDFVariableSpec(
+            variable.name,
+            variable.dim_ids,
+            variable.nc_type,
+            variable.attributes,
+            nc_variable_size(variable.dim_ids, dimensions, variable.nc_type),
+            0,
+        ) for variable in variables
+    ]
+
+    return sized_variables, field_name_map
+end
+
+function with_netcdf_variable_offsets(dimensions, global_attributes, variables)
+    scratch = IOBuffer()
+    write_nc_header(scratch, dimensions, global_attributes, variables)
+    offset = position(scratch)
+
+    variables_with_offsets = NetCDFVariableSpec[]
+    for variable in variables
+        push!(variables_with_offsets, NetCDFVariableSpec(
+            variable.name,
+            variable.dim_ids,
+            variable.nc_type,
+            variable.attributes,
+            variable.vsize,
+            offset,
+        ))
+        offset += variable.vsize
+    end
+
+    return variables_with_offsets
+end
+
+function write_netcdf_coordinate_data(io, values)
+    for value in values
+        write_nc_f64(io, value)
+    end
+end
+
+function write_netcdf_field_data(io, snapshot_series::SnapshotSeries, field_name, xgrid, ygrid, zgrid; round_digits = ROUND_DIGITS)
+    for snapshot in snapshot_series.snapshots
+        xgrid_i, ygrid_i, zgrid_i, volume, _ = point_values_to_masked_volume(
+            snapshot_series.x,
+            snapshot_series.y,
+            snapshot_series.z,
+            snapshot.fields[field_name];
+            round_digits = round_digits,
+        )
+        xgrid_i == xgrid || error("Export grid x coordinates changed while exporting $(field_name).")
+        ygrid_i == ygrid || error("Export grid y coordinates changed while exporting $(field_name).")
+        zgrid_i == zgrid || error("Export grid z coordinates changed while exporting $(field_name).")
+
+        for iz in eachindex(zgrid), iy in eachindex(ygrid), ix in eachindex(xgrid)
+            write_nc_f32(io, volume[ix, iy, iz])
+        end
+    end
+end
+
+function export_snapshot_series_to_netcdf(snapshot_series::SnapshotSeries, output_path; field_names = snapshot_series.field_names, round_digits = ROUND_DIGITS)
+    isempty(snapshot_series.snapshots) && error("Cannot export an empty snapshot series.")
+    isempty(field_names) && error("Cannot export NetCDF without point-data fields.")
+
+    lookup = point_grid_lookup(snapshot_series.x, snapshot_series.y, snapshot_series.z; round_digits = round_digits)
+    dimensions = [
+        ("time", length(snapshot_series.snapshots)),
+        ("x", length(lookup.xgrid)),
+        ("y", length(lookup.ygrid)),
+        ("z", length(lookup.zgrid)),
+    ]
+    global_attributes = Any[
+        nc_attribute("source", snapshot_series.source_name),
+        nc_attribute("created_by", "tool.jl"),
+        nc_attribute("conventions_note", "Scalar point data exported on regular time,z,y,x grid."),
+    ]
+    variables, field_name_map = netcdf_variable_specs(dimensions, field_names)
+    variables = with_netcdf_variable_offsets(dimensions, global_attributes, variables)
+
+    final_output_path = normalized_netcdf_output_path(output_path)
+    mkpath(dirname(final_output_path))
+    open(final_output_path, "w") do io
+        write_nc_header(io, dimensions, global_attributes, variables)
+        write_netcdf_coordinate_data(io, [snapshot.time for snapshot in snapshot_series.snapshots])
+        write_netcdf_coordinate_data(io, lookup.xgrid)
+        write_netcdf_coordinate_data(io, lookup.ygrid)
+        write_netcdf_coordinate_data(io, lookup.zgrid)
+        for (field_name, _) in field_name_map
+            write_netcdf_field_data(io, snapshot_series, field_name, lookup.xgrid, lookup.ygrid, lookup.zgrid; round_digits = round_digits)
+        end
+    end
+
+    return (
+        path = final_output_path,
+        fields = field_name_map,
+        dimensions = dimensions,
+    )
 end
 
 plane_name(plane::Symbol) = plane == :xy ? "XY" : plane == :yz ? "YZ" : plane == :xz ? "XZ" : error("Unsupported slice plane $(plane).")
@@ -1153,6 +1463,7 @@ function main(;
     btn_prime = Button(toolbar[1, 4], label = "Variable'")
     btn_average_profile = Button(toolbar[1, 5], label = "2D Mean")
     btn_velocity_stress = Button(toolbar[1, 6], label = "u'v'w'")
+    btn_exports = Button(toolbar[1, 7], label = "Exports")
     colgap!(toolbar, 10)
 
     main_layout = GridLayout(
@@ -1172,6 +1483,15 @@ function main(;
     slice_panel = GridLayout(main_layout[1, 1])
     prime_panel = GridLayout(main_layout[1, 1])
     average_profile_panel = GridLayout(main_layout[1, 1])
+    exports_panel = GridLayout(
+        main_layout[1, 1];
+        width = Relative(1),
+        height = Relative(1),
+        tellwidth = false,
+        tellheight = false,
+        valign = :top,
+        alignmode = Outside(),
+    )
     velocity_stress_panel = GridLayout(
         main_layout[1, 1];
         width = Relative(1),
@@ -1183,12 +1503,15 @@ function main(;
     )
     colgap!(slice_panel, 12)
     colgap!(average_profile_panel, 12)
+    colgap!(exports_panel, 12)
     colgap!(velocity_stress_panel, 8)
     rowgap!(cloud_panel, 10)
     rowgap!(average_profile_panel, 6)
+    rowgap!(exports_panel, 10)
     rowgap!(velocity_stress_panel, 6)
     colsize!(slice_panel, 1, Relative(1))
     colsize!(average_profile_panel, 1, Relative(1))
+    colsize!(exports_panel, 1, Relative(1))
     colsize!(cloud_panel, 1, Relative(1))
 
     current_view_mode = Ref(:slice)
@@ -1584,6 +1907,14 @@ function main(;
     end
     rowsize!(velocity_stress_panel, 4, Fixed(24))
 
+    export_status_text = Observable(
+        "Ready to export $(length(snapshot_series.snapshots)) timesteps and $(length(prime_field_names)) variables to NetCDF.",
+    )
+    exports_title = Label(exports_panel[1, 1], "NetCDF export", color = :black, fontsize = 24)
+    exports_status = Label(exports_panel[2, 1], export_status_text, color = :black, tellwidth = false)
+    rowsize!(exports_panel, 1, Fixed(44))
+    rowsize!(exports_panel, 2, Fixed(32))
+
     slice_controls = GridLayout(root_layout[3, 1])
     colgap!(slice_controls, 10)
     rowgap!(slice_controls, 8)
@@ -1705,14 +2036,27 @@ function main(;
     average_profile_controls = GridLayout(root_layout[5, 1])
     colgap!(average_profile_controls, 10)
     rowgap!(average_profile_controls, 8)
+    colsize!(average_profile_controls, 1, Fixed(130))
 
     average_profile_field_caption = Label(average_profile_controls[1, 1], "Variable:", color = :black)
-    average_profile_field_menu = Menu(
-        average_profile_controls[1, 2:4],
-        options = prime_field_names,
-        default = default_average_profile_field_name,
-        width = 360,
+    average_profile_field_selector = GridLayout(
+        average_profile_controls[1, 2:4];
+        tellwidth = false,
+        halign = :left,
     )
+    colgap!(average_profile_field_selector, 6)
+    rowgap!(average_profile_field_selector, 6)
+    average_profile_field_buttons = Dict{String, Any}()
+    average_profile_field_button_columns = min(length(prime_field_names), 8)
+    for (idx, field_name) in enumerate(prime_field_names)
+        row = div(idx - 1, average_profile_field_button_columns) + 1
+        col = mod(idx - 1, average_profile_field_button_columns) + 1
+        average_profile_field_buttons[field_name] = Button(
+            average_profile_field_selector[row, col],
+            label = field_name,
+            width = max(58, 14 * length(field_name) + 28),
+        )
+    end
     average_profile_direction_caption = Label(average_profile_controls[2, 1], "Average over:", color = :black)
     btn_average_x = Button(average_profile_controls[2, 2], label = "X -> YZ")
     btn_average_y = Button(average_profile_controls[2, 3], label = "Y -> XZ")
@@ -1723,6 +2067,38 @@ function main(;
     end
     average_profile_info = Label(average_profile_controls[3, 2:4], average_profile_info_text, color = :black)
     rowsize!(root_layout, 5, Fixed(0))
+
+    export_controls = GridLayout(exports_panel[3, 1])
+    colgap!(export_controls, 10)
+    rowgap!(export_controls, 8)
+    export_path_caption = Label(export_controls[1, 1], "NetCDF path:", color = :black)
+    export_path_textbox = Textbox(
+        export_controls[1, 2:4],
+        stored_string = DEFAULT_NETCDF_EXPORT_PATH,
+        width = 760,
+    )
+    export_button = Button(export_controls[1, 5], label = "Export to NetCDF", width = 160)
+    export_running = Observable(false)
+    rowsize!(exports_panel, 3, Fixed(48))
+
+    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu)
+
+    function close_menu!(menu)
+        menu.is_open[] = false
+    end
+
+    function close_other_menus!(active_menu)
+        for menu in dropdown_menus
+            menu === active_menu && continue
+            close_menu!(menu)
+        end
+    end
+
+    for menu in dropdown_menus
+        on(menu.is_open) do is_open
+            is_open && close_other_menus!(menu)
+        end
+    end
 
     function active_render_fields()
         return [field_name for field_name in render_field_names if render_checkbox_by_field[field_name].checked[]]
@@ -1838,6 +2214,7 @@ function main(;
     end
     on(slice_field_menu.selection) do field_name
         isnothing(field_name) && return
+        close_menu!(slice_field_menu)
 
         slice_data = build_slice_field_data(field_name, slice_snapshot_index[])
         selected_slice_field[] = field_name
@@ -1870,6 +2247,7 @@ function main(;
     end
     on(prime_field_menu.selection) do field_name
         isnothing(field_name) && return
+        close_menu!(prime_field_menu)
 
         prime_data = get_prime_data(field_name, prime_snapshot_index[])
         selected_prime_field[] = field_name
@@ -1884,6 +2262,7 @@ function main(;
         set_prime_slice_plane!(prime_slice_plane[])
     end
     function set_cloud_controls_visibility!(show_controls::Bool)
+        show_controls || close_menu!(cloud_speed_menu)
         update_render_visibility!()
         cloud_time_caption.visible[] = show_controls
         cloud_time_slider.blockscene.visible[] = show_controls
@@ -1903,6 +2282,7 @@ function main(;
     end
 
     function set_slice_controls_visibility!(show_controls::Bool)
+        show_controls || close_menu!(slice_field_menu)
         is_xy = show_controls && slice_plane[] == :xy
         is_yz = show_controls && slice_plane[] == :yz
         is_xz = show_controls && slice_plane[] == :xz
@@ -1938,6 +2318,7 @@ function main(;
     end
 
     function set_prime_controls_visibility!(show_controls::Bool)
+        show_controls || close_menu!(prime_field_menu)
         is_xy = show_controls && prime_slice_plane[] == :xy
         is_yz = show_controls && prime_slice_plane[] == :yz
         is_xz = show_controls && prime_slice_plane[] == :xz
@@ -1976,7 +2357,9 @@ function main(;
 
     function set_average_profile_controls_visibility!(show_controls::Bool)
         average_profile_field_caption.visible[] = show_controls
-        average_profile_field_menu.blockscene.visible[] = show_controls
+        for button in values(average_profile_field_buttons)
+            button.blockscene.visible[] = show_controls
+        end
         average_profile_direction_caption.visible[] = show_controls
         btn_average_x.blockscene.visible[] = show_controls
         btn_average_y.blockscene.visible[] = show_controls
@@ -1986,6 +2369,19 @@ function main(;
         rowsize!(average_profile_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
         rowsize!(average_profile_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
         rowsize!(average_profile_controls, 3, show_controls ? Auto(0.12) : Fixed(0))
+    end
+
+    function set_export_controls_visibility!(show_controls::Bool)
+        exports_title.visible[] = show_controls
+        exports_status.visible[] = show_controls
+        export_path_caption.visible[] = show_controls
+        export_path_textbox.blockscene.visible[] = show_controls
+        export_button.blockscene.visible[] = show_controls
+
+        rowsize!(exports_panel, 1, show_controls ? Fixed(44) : Fixed(0))
+        rowsize!(exports_panel, 2, show_controls ? Fixed(32) : Fixed(0))
+        rowsize!(exports_panel, 3, show_controls ? Fixed(48) : Fixed(0))
+        rowsize!(export_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
     end
 
     function update_average_profile_display!()
@@ -2005,6 +2401,19 @@ function main(;
             first(average_profile_data.ycoords),
             last(average_profile_data.ycoords),
         )
+    end
+
+    function update_average_profile_field_button_colors!()
+        for field_name in prime_field_names
+            average_profile_field_buttons[field_name].buttoncolor[] =
+                field_name == selected_average_profile_field[] ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
+        end
+    end
+
+    function set_average_profile_field!(field_name)
+        selected_average_profile_field[] = field_name
+        update_average_profile_display!()
+        update_average_profile_field_button_colors!()
     end
 
     function set_slice_plane!(plane::Symbol)
@@ -2089,6 +2498,7 @@ function main(;
         show_prime = mode == :prime
         show_average_profile = mode == :average_profile
         show_velocity_stress = mode == :velocity_stress
+        show_exports = mode == :exports
 
         show_cloud || stop_render_playback!()
 
@@ -2120,12 +2530,14 @@ function main(;
         set_slice_controls_visibility!(show_slice)
         set_prime_controls_visibility!(show_prime)
         set_average_profile_controls_visibility!(show_average_profile)
+        set_export_controls_visibility!(show_exports)
 
         btn_cloud.buttoncolor[] = show_cloud ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
         btn_slice.buttoncolor[] = show_slice ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
         btn_prime.buttoncolor[] = show_prime ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
         btn_average_profile.buttoncolor[] = show_average_profile ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
         btn_velocity_stress.buttoncolor[] = show_velocity_stress ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
+        btn_exports.buttoncolor[] = show_exports ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
 
         if show_cloud
             rowsize!(root_layout, 3, Fixed(0))
@@ -2153,11 +2565,42 @@ function main(;
         end
     end
 
-    on(average_profile_field_menu.selection) do field_name
-        isnothing(field_name) && return
+    on(export_button.clicks) do _
+        export_running[] && return
 
-        selected_average_profile_field[] = field_name
-        update_average_profile_display!()
+        export_running[] = true
+        export_button.label[] = "Exporting..."
+
+        requested_path = export_path_textbox.displayed_string[]
+        output_path = normalized_netcdf_output_path(requested_path)
+        export_status_text[] = "Exporting to $(output_path)..."
+
+        @async begin
+            try
+                result = export_snapshot_series_to_netcdf(
+                    snapshot_series,
+                    output_path;
+                    field_names = prime_field_names,
+                    round_digits = ROUND_DIGITS,
+                )
+                field_text = join(["$(field.first)=>$(field.second)" for field in result.fields], ", ")
+                export_status_text[] =
+                    "Exported $(length(snapshot_series.snapshots)) timesteps and $(length(result.fields)) variables to $(result.path). Fields: $(field_text)"
+            catch err
+                export_status_text[] = "Export failed: $(sprint(showerror, err))"
+            finally
+                export_button.label[] = "Export to NetCDF"
+                export_running[] = false
+            end
+        end
+    end
+
+    for field_name in prime_field_names
+        let field_name = field_name
+            on(average_profile_field_buttons[field_name].clicks) do _
+                set_average_profile_field!(field_name)
+            end
+        end
     end
 
     on(btn_cloud.clicks) do _
@@ -2174,6 +2617,9 @@ function main(;
     end
     on(btn_velocity_stress.clicks) do _
         set_view_mode!(:velocity_stress)
+    end
+    on(btn_exports.clicks) do _
+        set_view_mode!(:exports)
     end
     on(btn_xy.clicks) do _
         set_slice_plane!(:xy)
@@ -2206,6 +2652,7 @@ function main(;
     set_slice_plane!(:xy)
     set_prime_slice_plane!(:xy)
     set_average_profile_direction!(default_average_profile_direction)
+    update_average_profile_field_button_colors!()
     set_view_mode!(:slice)
 
     if display_figure
