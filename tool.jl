@@ -26,6 +26,27 @@ const RENDER_VARIABLE_COLORS = Dict(
     "θ" => RGBf(0.92, 0.78, 0.20),
     "θp" => RGBf(0.64, 0.32, 0.88),
 )
+const LIGHT_BACKGROUND = RGBf(1, 1, 1)
+const LIGHT_TEXT_COLOR = RGBf(0, 0, 0)
+const LIGHT_GRID_COLOR = RGBAf(0, 0, 0, 0.12)
+const LIGHT_BUTTON_ACTIVE = RGBf(0.85, 0.90, 0.98)
+const LIGHT_BUTTON_INACTIVE = RGBf(0.80, 0.84, 0.90)
+const LIGHT_BUTTON_HOVER = RGBf(0.88, 0.92, 0.98)
+const LIGHT_MENU_BACKGROUND = RGBf(0.97, 0.97, 0.97)
+const DARK_BACKGROUND = RGBf(0.06, 0.07, 0.09)
+const DARK_TEXT_COLOR = RGBf(0.94, 0.95, 0.97)
+const DARK_GRID_COLOR = RGBAf(1, 1, 1, 0.16)
+const DARK_BUTTON_ACTIVE = RGBf(0.20, 0.31, 0.48)
+const DARK_BUTTON_INACTIVE = RGBf(0.14, 0.16, 0.20)
+const DARK_BUTTON_HOVER = RGBf(0.24, 0.29, 0.37)
+const DARK_MENU_BACKGROUND = RGBf(0.11, 0.12, 0.15)
+const APP_BACKGROUND = LIGHT_BACKGROUND
+const APP_TEXT_COLOR = LIGHT_TEXT_COLOR
+const APP_GRID_COLOR = LIGHT_GRID_COLOR
+const CONTROL_LABEL_WIDTH = 160
+const CONTROL_ROW_HEIGHT = 40
+const CONTROL_SLIDER_WIDTH = 560
+const CONTROL_PANEL_HEIGHT = 320
 const LAST_FIGURE = Ref{Any}(nothing)
 const LAST_SCREEN = Ref{Any}(nothing)
 
@@ -700,14 +721,6 @@ function average_profile_title(field_name, direction::Symbol)
     return "$(average_profile_label(field_name, direction)), time-avg on $(plane) plane"
 end
 
-function average_profile_note_text(field_name, direction::Symbol, snapshot_count, series_mode, source_label)
-    label = average_profile_label(field_name, direction)
-    if snapshot_count > 1
-        return "$(label), time-averaged over $(snapshot_count) file timesteps from $(source_label)"
-    end
-    return "$(label), single-snapshot spatial average from $(source_label)"
-end
-
 function slice_axis_title(field_name, plane::Symbol)
     if plane == :xy
         return "$(field_name) on XY slice (fixed z)"
@@ -721,7 +734,6 @@ end
 volume_axis_title(field_name, time) = "$(field_name) volume, $(time_label(time))"
 render_axis_title(time) = "3D volume render, $(time_label(time))"
 prime_field_label(field_name) = "$(field_name)'"
-prime_mean_label(field_name) = "<$(field_name)>_xy(z)"
 
 function prime_axis_title(field_name, plane::Symbol)
     if plane == :xy
@@ -733,15 +745,9 @@ function prime_axis_title(field_name, plane::Symbol)
     end
 end
 
-function prime_formula_text(field_name, residual_value, source_name)
-    return "$(prime_field_label(field_name)) = $(field_name) - $(prime_mean_label(field_name)) using $(source_name)   " *
-           "max |<$(prime_field_label(field_name))>_xy(z)| = $(round(residual_value, sigdigits = 5))"
-end
-
 velocity_component_label(i) = VELOCITY_COMPONENT_FIELD_NAMES[i]
 velocity_stress_pair_label(i, j) = "$(velocity_component_label(i))'$(velocity_component_label(j))'"
 velocity_stress_profile_label(i, j) = "⟨$(velocity_stress_pair_label(i, j))⟩_xy(z)"
-velocity_stress_symbol() = "⟨a'b'⟩_xy(z), a,b in {u,v,w}"
 
 function profile_maxabs(values)
     isempty(values) && return 0.0
@@ -1030,14 +1036,6 @@ function most_informative_z_index(prime_volume, valid_mask)
     end
 
     return best_index
-end
-
-function matrix_stats(matrix)
-    values = matrix[.!isnan.(matrix)]
-    isempty(values) && return "No valid cells are present in this view."
-
-    return "cells: $(length(values))   min: $(round(minimum(values), sigdigits = 5))   " *
-           "max: $(round(maximum(values), sigdigits = 5))   mean: $(round(sum(values) / length(values), sigdigits = 5))"
 end
 
 function prime_residual(prime_volume, valid_mask, mean_dims)
@@ -1446,9 +1444,7 @@ function main(;
     default_average_profile_direction = :z
     default_average_profile_data = get_average_profile_data(default_average_profile_field_name, default_average_profile_direction)
 
-    sky = RGBf(0.56, 0.76, 0.94)
-
-    fig = Figure(size = (1500, 860), backgroundcolor = sky)
+    fig = Figure(size = (1500, 860), backgroundcolor = APP_BACKGROUND)
     colsize!(fig.layout, 1, Relative(1))
     rowsize!(fig.layout, 1, Relative(1))
 
@@ -1457,13 +1453,14 @@ function main(;
     rowgap!(root_layout, 8)
 
     toolbar = GridLayout(root_layout[1, 1])
-    Label(toolbar[1, 1], "View tool:", color = :black)
-    btn_cloud = Button(toolbar[1, 2], label = "3D Volume")
-    btn_slice = Button(toolbar[1, 3], label = "Slices")
-    btn_prime = Button(toolbar[1, 4], label = "Variable'")
-    btn_average_profile = Button(toolbar[1, 5], label = "2D Mean")
-    btn_velocity_stress = Button(toolbar[1, 6], label = "u'v'w'")
-    btn_exports = Button(toolbar[1, 7], label = "Exports")
+    btn_cloud = Button(toolbar[1, 1], label = "3D Volume")
+    btn_slice = Button(toolbar[1, 2], label = "Slices")
+    btn_prime = Button(toolbar[1, 3], label = "Variable'")
+    btn_average_profile = Button(toolbar[1, 4], label = "2D Mean")
+    btn_velocity_stress = Button(toolbar[1, 5], label = "u'v'w'")
+    btn_exports = Button(toolbar[1, 6], label = "Exports")
+    dark_mode_caption = Label(toolbar[1, 7], "Dark mode:", color = APP_TEXT_COLOR)
+    dark_mode_checkbox = Checkbox(toolbar[1, 8]; checked = false)
     colgap!(toolbar, 10)
 
     main_layout = GridLayout(
@@ -1520,7 +1517,6 @@ function main(;
         field_name => Observable(get_render_frames(field_name)[default_snapshot_index].q_rgba)
         for field_name in render_field_names
     )
-    cloud_info_text = Observable("")
 
     ax3d = Axis3(
         cloud_panel[1, 1],
@@ -1531,17 +1527,17 @@ function main(;
         aspect = (1, 1, 0.55),
         elevation = 0.35,
         azimuth = 5.0,
-        backgroundcolor = sky,
-        titlecolor = :black,
-        xlabelcolor = :black,
-        ylabelcolor = :black,
-        zlabelcolor = :black,
-        xticklabelcolor = :black,
-        yticklabelcolor = :black,
-        zticklabelcolor = :black,
-        xtickcolor = :black,
-        ytickcolor = :black,
-        ztickcolor = :black,
+        backgroundcolor = APP_BACKGROUND,
+        titlecolor = APP_TEXT_COLOR,
+        xlabelcolor = APP_TEXT_COLOR,
+        ylabelcolor = APP_TEXT_COLOR,
+        zlabelcolor = APP_TEXT_COLOR,
+        xticklabelcolor = APP_TEXT_COLOR,
+        yticklabelcolor = APP_TEXT_COLOR,
+        zticklabelcolor = APP_TEXT_COLOR,
+        xtickcolor = APP_TEXT_COLOR,
+        ytickcolor = APP_TEXT_COLOR,
+        ztickcolor = APP_TEXT_COLOR,
         xgridvisible = false,
         ygridvisible = false,
         zgridvisible = false,
@@ -1592,7 +1588,7 @@ function main(;
     rowgap!(render_checklist, 8)
     colgap!(render_checklist, 8)
     colsize!(render_checklist, 1, Fixed(24))
-    render_checklist_title = Label(render_checklist[1, 1:2], "Render variables:", color = :black, halign = :left)
+    render_checklist_title = Label(render_checklist[1, 1:2], "Render variables:", color = APP_TEXT_COLOR, halign = :left)
     render_checkbox_by_field = Dict{String, Any}()
     render_checkbox_labels = Dict{String, Any}()
     for (row, field_name) in enumerate(render_field_names)
@@ -1612,7 +1608,7 @@ function main(;
 
     cloud_controls = GridLayout(cloud_panel[2, 1])
     colgap!(cloud_controls, 10)
-    cloud_time_caption = Label(cloud_controls[1, 1], "Time step:", color = :black)
+    cloud_time_caption = Label(cloud_controls[1, 1], "Time step:", color = APP_TEXT_COLOR)
     cloud_time_slider = Slider(
         cloud_controls[1, 2],
         range = 0:(length(snapshots) - 1),
@@ -1622,8 +1618,8 @@ function main(;
     )
     cloud_time_text = Label(cloud_controls[1, 3], lift(render_snapshot_index) do idx
         time_label(snapshots[idx].time)
-    end, color = :black)
-    cloud_speed_caption = Label(cloud_controls[1, 4], "Speed:", color = :black)
+    end, color = APP_TEXT_COLOR)
+    cloud_speed_caption = Label(cloud_controls[1, 4], "Speed:", color = APP_TEXT_COLOR)
     cloud_speed_menu = Menu(
         cloud_controls[1, 5],
         options = RENDER_PLAYBACK_SPEED_OPTIONS,
@@ -1632,9 +1628,7 @@ function main(;
     )
     cloud_play_button = Button(cloud_controls[1, 6], label = "Play", width = 80)
 
-    cloud_info = Label(cloud_panel[3, 1], cloud_info_text, color = :black)
     rowsize!(cloud_panel, 2, Fixed(42))
-    rowsize!(cloud_panel, 3, Fixed(24))
 
     function build_slice_field_data(field_name, snapshot_index::Int)
         snapshot = snapshots[snapshot_index]
@@ -1679,16 +1673,16 @@ function main(;
         yzoomlock = true,
         xpanlock = true,
         ypanlock = true,
-        backgroundcolor = RGBf(0.93, 0.96, 1.0),
-        titlecolor = :black,
-        xlabelcolor = :black,
-        ylabelcolor = :black,
-        xticklabelcolor = :black,
-        yticklabelcolor = :black,
-        xtickcolor = :black,
-        ytickcolor = :black,
-        xgridcolor = RGBAf(0, 0, 0, 0.10),
-        ygridcolor = RGBAf(0, 0, 0, 0.10),
+        backgroundcolor = APP_BACKGROUND,
+        titlecolor = APP_TEXT_COLOR,
+        xlabelcolor = APP_TEXT_COLOR,
+        ylabelcolor = APP_TEXT_COLOR,
+        xticklabelcolor = APP_TEXT_COLOR,
+        yticklabelcolor = APP_TEXT_COLOR,
+        xtickcolor = APP_TEXT_COLOR,
+        ytickcolor = APP_TEXT_COLOR,
+        xgridcolor = APP_GRID_COLOR,
+        ygridcolor = APP_GRID_COLOR,
     )
 
     slice_xcoords = lift(slice_plane, selected_slice_data) do plane, slice_data
@@ -1716,9 +1710,9 @@ function main(;
         nan_color = RGBAf(0, 0, 0, 0),
     )
     cbar = Colorbar(slice_panel[1, 2], hm, label = selected_slice_field, width = 20)
-    cbar.labelcolor = :black
-    cbar.ticklabelcolor = :black
-    cbar.tickcolor = :black
+    cbar.labelcolor = APP_TEXT_COLOR
+    cbar.ticklabelcolor = APP_TEXT_COLOR
+    cbar.tickcolor = APP_TEXT_COLOR
 
     prime_slice_panel = GridLayout(prime_panel[1, 1])
     colgap!(prime_slice_panel, 12)
@@ -1752,16 +1746,16 @@ function main(;
         xlabel = "x (m)",
         ylabel = "y (m)",
         aspect = DataAspect(),
-        backgroundcolor = RGBf(0.97, 0.98, 1.0),
-        titlecolor = :black,
-        xlabelcolor = :black,
-        ylabelcolor = :black,
-        xticklabelcolor = :black,
-        yticklabelcolor = :black,
-        xtickcolor = :black,
-        ytickcolor = :black,
-        xgridcolor = RGBAf(0, 0, 0, 0.10),
-        ygridcolor = RGBAf(0, 0, 0, 0.10),
+        backgroundcolor = APP_BACKGROUND,
+        titlecolor = APP_TEXT_COLOR,
+        xlabelcolor = APP_TEXT_COLOR,
+        ylabelcolor = APP_TEXT_COLOR,
+        xticklabelcolor = APP_TEXT_COLOR,
+        yticklabelcolor = APP_TEXT_COLOR,
+        xtickcolor = APP_TEXT_COLOR,
+        ytickcolor = APP_TEXT_COLOR,
+        xgridcolor = APP_GRID_COLOR,
+        ygridcolor = APP_GRID_COLOR,
     )
     hm_prime = heatmap!(
         ax_prime,
@@ -1775,9 +1769,9 @@ function main(;
     cbar_prime = Colorbar(prime_slice_panel[1, 2], hm_prime, label = lift(selected_prime_field) do field_name
         prime_field_label(field_name)
     end, width = 20)
-    cbar_prime.labelcolor = :black
-    cbar_prime.ticklabelcolor = :black
-    cbar_prime.tickcolor = :black
+    cbar_prime.labelcolor = APP_TEXT_COLOR
+    cbar_prime.ticklabelcolor = APP_TEXT_COLOR
+    cbar_prime.tickcolor = APP_TEXT_COLOR
 
     selected_average_profile_field = Observable(default_average_profile_field_name)
     average_profile_direction = Observable(default_average_profile_direction)
@@ -1805,16 +1799,16 @@ function main(;
         xlabel = "x (m)",
         ylabel = "y (m)",
         aspect = DataAspect(),
-        backgroundcolor = RGBf(0.97, 0.98, 1.0),
-        titlecolor = :black,
-        xlabelcolor = :black,
-        ylabelcolor = :black,
-        xticklabelcolor = :black,
-        yticklabelcolor = :black,
-        xtickcolor = :black,
-        ytickcolor = :black,
-        xgridcolor = RGBAf(0, 0, 0, 0.10),
-        ygridcolor = RGBAf(0, 0, 0, 0.10),
+        backgroundcolor = APP_BACKGROUND,
+        titlecolor = APP_TEXT_COLOR,
+        xlabelcolor = APP_TEXT_COLOR,
+        ylabelcolor = APP_TEXT_COLOR,
+        xticklabelcolor = APP_TEXT_COLOR,
+        yticklabelcolor = APP_TEXT_COLOR,
+        xtickcolor = APP_TEXT_COLOR,
+        ytickcolor = APP_TEXT_COLOR,
+        xgridcolor = APP_GRID_COLOR,
+        ygridcolor = APP_GRID_COLOR,
     )
     hm_average_profile = heatmap!(
         ax_average_profile,
@@ -1833,23 +1827,16 @@ function main(;
         end,
         width = 20,
     )
-    cbar_average_profile.labelcolor = :black
-    cbar_average_profile.ticklabelcolor = :black
-    cbar_average_profile.tickcolor = :black
+    cbar_average_profile.labelcolor = APP_TEXT_COLOR
+    cbar_average_profile.ticklabelcolor = APP_TEXT_COLOR
+    cbar_average_profile.tickcolor = APP_TEXT_COLOR
     average_profile_note = Label(
         average_profile_panel[2, 1:2],
-        lift(selected_average_profile_field, average_profile_direction, selected_average_profile_data) do field_name, direction, average_profile_data
-            average_profile_note_text(
-                field_name,
-                direction,
-                average_profile_data.snapshot_count,
-                average_profile_data.series_mode,
-                snapshot_series.source_name,
-            )
-        end,
-        color = :black,
+        "",
+        color = APP_TEXT_COLOR,
+        visible = false,
     )
-    rowsize!(average_profile_panel, 2, Fixed(24))
+    rowsize!(average_profile_panel, 2, Fixed(0))
 
     velocity_stress_axes = Matrix{Any}(undef, 3, 3)
     velocity_stress_lines = Matrix{Any}(undef, 3, 3)
@@ -1873,16 +1860,16 @@ function main(;
             ylabelsize = 10,
             xticklabelsize = 9,
             yticklabelsize = 9,
-            backgroundcolor = RGBf(0.97, 0.98, 1.0),
-            titlecolor = :black,
-            xlabelcolor = :black,
-            ylabelcolor = :black,
-            xticklabelcolor = :black,
-            yticklabelcolor = :black,
-            xtickcolor = :black,
-            ytickcolor = :black,
-            xgridcolor = RGBAf(0, 0, 0, 0.10),
-            ygridcolor = RGBAf(0, 0, 0, 0.10),
+            backgroundcolor = APP_BACKGROUND,
+            titlecolor = APP_TEXT_COLOR,
+            xlabelcolor = APP_TEXT_COLOR,
+            ylabelcolor = APP_TEXT_COLOR,
+            xticklabelcolor = APP_TEXT_COLOR,
+            yticklabelcolor = APP_TEXT_COLOR,
+            xtickcolor = APP_TEXT_COLOR,
+            ytickcolor = APP_TEXT_COLOR,
+            xgridcolor = APP_GRID_COLOR,
+            ygridcolor = APP_GRID_COLOR,
         )
 
         line = lines!(ax, display_profile, velocity_stress_data.zgrid; color = RGBf(0.10, 0.25, 0.55), linewidth = 2)
@@ -1892,186 +1879,178 @@ function main(;
         velocity_stress_axes[i, j] = ax
         velocity_stress_lines[i, j] = line
     end
-    velocity_stress_note_text =
-        if velocity_stress_data.snapshot_count > 1
-            "$(velocity_stress_symbol()), time-averaged over $(velocity_stress_data.snapshot_count) file timesteps using primitive fields u, v, w from $(snapshot_series.source_name)"
-        else
-            "$(velocity_stress_symbol()), using primitive fields u, v, w from $(snapshot_series.source_name)"
-        end
-    velocity_stress_note = Label(velocity_stress_panel[4, 1:3], velocity_stress_note_text, color = :black)
+    velocity_stress_note = Label(velocity_stress_panel[4, 1:3], "", color = APP_TEXT_COLOR, visible = false)
     for row in 1:3
         rowsize!(velocity_stress_panel, row, Auto(false, 1))
     end
     for col in 1:3
         colsize!(velocity_stress_panel, col, Relative(1 / 3))
     end
-    rowsize!(velocity_stress_panel, 4, Fixed(24))
+    rowsize!(velocity_stress_panel, 4, Fixed(0))
 
-    export_status_text = Observable(
-        "Ready to export $(length(snapshot_series.snapshots)) timesteps and $(length(prime_field_names)) variables to NetCDF.",
-    )
-    exports_title = Label(exports_panel[1, 1], "NetCDF export", color = :black, fontsize = 24)
-    exports_status = Label(exports_panel[2, 1], export_status_text, color = :black, tellwidth = false)
-    rowsize!(exports_panel, 1, Fixed(44))
+    export_status_text = Observable("")
+    exports_title = Label(exports_panel[1, 1], "NetCDF export", color = APP_TEXT_COLOR, fontsize = 24, visible = false)
+    exports_status = Label(exports_panel[2, 1], export_status_text, color = APP_TEXT_COLOR, tellwidth = false)
+    rowsize!(exports_panel, 1, Fixed(0))
     rowsize!(exports_panel, 2, Fixed(32))
 
-    slice_controls = GridLayout(root_layout[3, 1])
+    slice_controls = GridLayout(root_layout[3, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
     colgap!(slice_controls, 10)
     rowgap!(slice_controls, 8)
+    colsize!(slice_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
 
-    slice_field_caption = Label(slice_controls[1, 1], "Variable:", color = :black)
+    slice_field_caption = Label(slice_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
     slice_field_menu = Menu(
-        slice_controls[1, 2:4],
+        slice_controls[1, 2],
         options = prime_field_names,
         default = default_slice_field_name,
         width = 360,
+        direction = :down,
     )
 
-    slice_time_caption = Label(slice_controls[2, 1], "Time step:", color = :black)
+    slice_time_caption = Label(slice_controls[2, 1], "Time step:", color = APP_TEXT_COLOR, halign = :right)
+    slice_time_row = GridLayout(slice_controls[2, 2]; tellwidth = false, halign = :left)
+    colgap!(slice_time_row, 10)
     slice_time_slider = Slider(
-        slice_controls[2, 2:3],
+        slice_time_row[1, 1],
         range = 0:(length(snapshots) - 1),
         startvalue = 0,
-        width = 700,
+        width = CONTROL_SLIDER_WIDTH,
         snap = true,
     )
-    slice_time_text = Label(slice_controls[2, 4], lift(slice_snapshot_index) do idx
+    slice_time_text = Label(slice_time_row[1, 2], lift(slice_snapshot_index) do idx
         time_label(snapshots[idx].time)
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
 
-    plane_caption = Label(slice_controls[3, 1], "Slice plane:", color = :black)
-    btn_xy = Button(slice_controls[3, 2], label = "XY (fix z)")
-    btn_yz = Button(slice_controls[3, 3], label = "YZ (fix x)")
-    btn_xz = Button(slice_controls[3, 4], label = "XZ (fix y)")
+    plane_caption = Label(slice_controls[3, 1], "Slice plane:", color = APP_TEXT_COLOR, halign = :right)
+    slice_plane_buttons = GridLayout(slice_controls[3, 2]; tellwidth = false, halign = :left)
+    colgap!(slice_plane_buttons, 10)
+    btn_xy = Button(slice_plane_buttons[1, 1], label = "XY (fix z)")
+    btn_yz = Button(slice_plane_buttons[1, 2], label = "YZ (fix x)")
+    btn_xz = Button(slice_plane_buttons[1, 3], label = "XZ (fix y)")
 
-    z_caption = Label(slice_controls[4, 1], "Z slice:", color = :black)
-    z_slider = Slider(slice_controls[4, 2:3], range = slider_range(default_slice_data.zgrid), startvalue = default_slice_data.z0, width = 700, snap = false)
-    z_text = Label(slice_controls[4, 4], lift(z_value) do zv
+    z_caption = Label(slice_controls[4, 1], "Z slice:", color = APP_TEXT_COLOR, halign = :right)
+    z_row = GridLayout(slice_controls[4, 2]; tellwidth = false, halign = :left)
+    colgap!(z_row, 10)
+    z_slider = Slider(z_row[1, 1], range = slider_range(default_slice_data.zgrid), startvalue = default_slice_data.z0, width = CONTROL_SLIDER_WIDTH, snap = false)
+    z_text = Label(z_row[1, 2], lift(z_value) do zv
         "z = $(round(zv, digits = 2)) m"
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
 
-    x_caption = Label(slice_controls[5, 1], "X slice:", color = :black)
-    x_slider = Slider(slice_controls[5, 2:3], range = slider_range(default_slice_data.xgrid), startvalue = default_slice_data.x0, width = 700, snap = false)
-    x_text = Label(slice_controls[5, 4], lift(x_value) do xv
+    x_caption = Label(slice_controls[5, 1], "X slice:", color = APP_TEXT_COLOR, halign = :right)
+    x_row = GridLayout(slice_controls[5, 2]; tellwidth = false, halign = :left)
+    colgap!(x_row, 10)
+    x_slider = Slider(x_row[1, 1], range = slider_range(default_slice_data.xgrid), startvalue = default_slice_data.x0, width = CONTROL_SLIDER_WIDTH, snap = false)
+    x_text = Label(x_row[1, 2], lift(x_value) do xv
         "x = $(round(xv, digits = 2)) m"
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
 
-    y_caption = Label(slice_controls[6, 1], "Y slice:", color = :black)
-    y_slider = Slider(slice_controls[6, 2:3], range = slider_range(default_slice_data.ygrid), startvalue = default_slice_data.y0, width = 700, snap = false)
-    y_text = Label(slice_controls[6, 4], lift(y_value) do yv
+    y_caption = Label(slice_controls[6, 1], "Y slice:", color = APP_TEXT_COLOR, halign = :right)
+    y_row = GridLayout(slice_controls[6, 2]; tellwidth = false, halign = :left)
+    colgap!(y_row, 10)
+    y_slider = Slider(y_row[1, 1], range = slider_range(default_slice_data.ygrid), startvalue = default_slice_data.y0, width = CONTROL_SLIDER_WIDTH, snap = false)
+    y_text = Label(y_row[1, 2], lift(y_value) do yv
         "y = $(round(yv, digits = 2)) m"
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
 
-    slice_info_text = lift(selected_slice_field, slice_plane, selected_slice_data, x_value, y_value, z_value) do field_name, plane, slice_data, xv, yv, zv
-        plane_id = plane_name(plane)
-        slice = volume_slice(slice_data.plotted_volume, plane, slice_data.xgrid, slice_data.ygrid, slice_data.zgrid, xv, yv, zv)
-        "$(field_name) on " * plane_id * " slice   " * matrix_stats(slice)
-    end
-    slice_info = Label(slice_controls[7, 2:4], slice_info_text, color = :black)
+    slice_info = Label(slice_controls[7, 2], "", color = APP_TEXT_COLOR, visible = false)
 
-    prime_controls = GridLayout(root_layout[4, 1])
+    prime_controls = GridLayout(root_layout[4, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
     colgap!(prime_controls, 10)
     rowgap!(prime_controls, 8)
+    colsize!(prime_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
 
     rowsize!(root_layout, 1, Fixed(44))
     rowsize!(root_layout, 2, Auto(false, 1))
     rowsize!(root_layout, 3, Fixed(0))
     rowsize!(root_layout, 4, Fixed(0))
 
-    prime_field_caption = Label(prime_controls[1, 1], "Variable:", color = :black)
+    prime_field_caption = Label(prime_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
     prime_field_menu = Menu(
-        prime_controls[1, 2:4],
+        prime_controls[1, 2],
         options = prime_field_names,
         default = default_prime_field_name,
         width = 360,
+        direction = :down,
     )
-    prime_time_caption = Label(prime_controls[2, 1], "Time step:", color = :black)
+    prime_time_caption = Label(prime_controls[2, 1], "Time step:", color = APP_TEXT_COLOR, halign = :right)
+    prime_time_row = GridLayout(prime_controls[2, 2]; tellwidth = false, halign = :left)
+    colgap!(prime_time_row, 10)
     prime_time_slider = Slider(
-        prime_controls[2, 2:3],
+        prime_time_row[1, 1],
         range = 0:(length(snapshots) - 1),
         startvalue = 0,
-        width = 560,
+        width = CONTROL_SLIDER_WIDTH,
         snap = true,
     )
-    prime_time_text = Label(prime_controls[2, 4], lift(prime_snapshot_index) do idx
+    prime_time_text = Label(prime_time_row[1, 2], lift(prime_snapshot_index) do idx
         time_label(snapshots[idx].time)
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
     prime_formula = Label(
-        prime_controls[3, 1:4],
-        lift(selected_prime_field, selected_prime_data, prime_snapshot_index) do field_name, prime_data, idx
-            prime_formula_text(field_name, prime_data.residual_value, "$(snapshot_series.source_name), $(time_label(snapshots[idx].time))")
-        end,
-        color = :black,
+        prime_controls[3, 2],
+        "",
+        color = APP_TEXT_COLOR,
+        visible = false,
     )
-    prime_plane_caption = Label(prime_controls[4, 1], "Prime slice plane:", color = :black)
-    btn_prime_xy = Button(prime_controls[4, 2], label = "XY (fix z)")
-    btn_prime_yz = Button(prime_controls[4, 3], label = "YZ (fix x)")
-    btn_prime_xz = Button(prime_controls[4, 4], label = "XZ (fix y)")
+    prime_plane_caption = Label(prime_controls[4, 1], "Prime slice plane:", color = APP_TEXT_COLOR, halign = :right)
+    prime_plane_buttons = GridLayout(prime_controls[4, 2]; tellwidth = false, halign = :left)
+    colgap!(prime_plane_buttons, 10)
+    btn_prime_xy = Button(prime_plane_buttons[1, 1], label = "XY (fix z)")
+    btn_prime_yz = Button(prime_plane_buttons[1, 2], label = "YZ (fix x)")
+    btn_prime_xz = Button(prime_plane_buttons[1, 3], label = "XZ (fix y)")
 
-    prime_z_caption = Label(prime_controls[5, 1], "Prime Z slice:", color = :black)
-    prime_z_slider = Slider(prime_controls[5, 2:3], range = slider_range(default_prime_data.zgrid), startvalue = default_prime_data.z0, width = 560, snap = false)
-    prime_z_text = Label(prime_controls[5, 4], lift(prime_z_value) do zv
+    prime_z_caption = Label(prime_controls[5, 1], "Prime Z slice:", color = APP_TEXT_COLOR, halign = :right)
+    prime_z_row = GridLayout(prime_controls[5, 2]; tellwidth = false, halign = :left)
+    colgap!(prime_z_row, 10)
+    prime_z_slider = Slider(prime_z_row[1, 1], range = slider_range(default_prime_data.zgrid), startvalue = default_prime_data.z0, width = CONTROL_SLIDER_WIDTH, snap = false)
+    prime_z_text = Label(prime_z_row[1, 2], lift(prime_z_value) do zv
         "z = $(round(zv, digits = 2)) m"
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
 
-    prime_x_caption = Label(prime_controls[6, 1], "Prime X slice:", color = :black)
-    prime_x_slider = Slider(prime_controls[6, 2:3], range = slider_range(default_prime_data.xgrid), startvalue = default_prime_data.x0, width = 560, snap = false)
-    prime_x_text = Label(prime_controls[6, 4], lift(prime_x_value) do xv
+    prime_x_caption = Label(prime_controls[6, 1], "Prime X slice:", color = APP_TEXT_COLOR, halign = :right)
+    prime_x_row = GridLayout(prime_controls[6, 2]; tellwidth = false, halign = :left)
+    colgap!(prime_x_row, 10)
+    prime_x_slider = Slider(prime_x_row[1, 1], range = slider_range(default_prime_data.xgrid), startvalue = default_prime_data.x0, width = CONTROL_SLIDER_WIDTH, snap = false)
+    prime_x_text = Label(prime_x_row[1, 2], lift(prime_x_value) do xv
         "x = $(round(xv, digits = 2)) m"
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
 
-    prime_y_caption = Label(prime_controls[7, 1], "Prime Y slice:", color = :black)
-    prime_y_slider = Slider(prime_controls[7, 2:3], range = slider_range(default_prime_data.ygrid), startvalue = default_prime_data.y0, width = 560, snap = false)
-    prime_y_text = Label(prime_controls[7, 4], lift(prime_y_value) do yv
+    prime_y_caption = Label(prime_controls[7, 1], "Prime Y slice:", color = APP_TEXT_COLOR, halign = :right)
+    prime_y_row = GridLayout(prime_controls[7, 2]; tellwidth = false, halign = :left)
+    colgap!(prime_y_row, 10)
+    prime_y_slider = Slider(prime_y_row[1, 1], range = slider_range(default_prime_data.ygrid), startvalue = default_prime_data.y0, width = CONTROL_SLIDER_WIDTH, snap = false)
+    prime_y_text = Label(prime_y_row[1, 2], lift(prime_y_value) do yv
         "y = $(round(yv, digits = 2)) m"
-    end, color = :black)
+    end, color = APP_TEXT_COLOR)
 
-    prime_info_text = lift(selected_prime_field, prime_slice_plane, selected_prime_data, prime_x_value, prime_y_value, prime_z_value) do field_name, plane, prime_data, xv, yv, zv
-        plane_id = plane_name(plane)
-        slice = volume_slice(prime_data.plotted_prime_volume, plane, prime_data.xgrid, prime_data.ygrid, prime_data.zgrid, xv, yv, zv)
-        "$(prime_field_label(field_name)) on " * plane_id * " slice   " * matrix_stats(slice)
-    end
-    prime_info = Label(prime_controls[8, 2:4], prime_info_text, color = :black)
+    prime_info = Label(prime_controls[8, 2], "", color = APP_TEXT_COLOR, visible = false)
 
-    average_profile_controls = GridLayout(root_layout[5, 1])
+    average_profile_controls = GridLayout(root_layout[5, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
     colgap!(average_profile_controls, 10)
     rowgap!(average_profile_controls, 8)
-    colsize!(average_profile_controls, 1, Fixed(130))
+    colsize!(average_profile_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
 
-    average_profile_field_caption = Label(average_profile_controls[1, 1], "Variable:", color = :black)
-    average_profile_field_selector = GridLayout(
-        average_profile_controls[1, 2:4];
-        tellwidth = false,
-        halign = :left,
+    average_profile_field_caption = Label(average_profile_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
+    average_profile_field_menu = Menu(
+        average_profile_controls[1, 2],
+        options = prime_field_names,
+        default = default_average_profile_field_name,
+        width = 360,
+        direction = :down,
     )
-    colgap!(average_profile_field_selector, 6)
-    rowgap!(average_profile_field_selector, 6)
-    average_profile_field_buttons = Dict{String, Any}()
-    average_profile_field_button_columns = min(length(prime_field_names), 8)
-    for (idx, field_name) in enumerate(prime_field_names)
-        row = div(idx - 1, average_profile_field_button_columns) + 1
-        col = mod(idx - 1, average_profile_field_button_columns) + 1
-        average_profile_field_buttons[field_name] = Button(
-            average_profile_field_selector[row, col],
-            label = field_name,
-            width = max(58, 14 * length(field_name) + 28),
-        )
-    end
-    average_profile_direction_caption = Label(average_profile_controls[2, 1], "Average over:", color = :black)
-    btn_average_x = Button(average_profile_controls[2, 2], label = "X -> YZ")
-    btn_average_y = Button(average_profile_controls[2, 3], label = "Y -> XZ")
-    btn_average_z = Button(average_profile_controls[2, 4], label = "Z -> XY")
-    average_profile_info_text = lift(selected_average_profile_field, average_profile_direction, selected_average_profile_data) do field_name, direction, average_profile_data
-        plane_id = plane_name(average_profile_data.plane)
-        "$(average_profile_label(field_name, direction)) on " * plane_id * " plane   " * matrix_stats(average_profile_data.profile)
-    end
-    average_profile_info = Label(average_profile_controls[3, 2:4], average_profile_info_text, color = :black)
+    average_profile_direction_caption = Label(average_profile_controls[2, 1], "Average over:", color = APP_TEXT_COLOR, halign = :right)
+    average_profile_direction_buttons = GridLayout(average_profile_controls[2, 2]; tellwidth = false, halign = :left)
+    colgap!(average_profile_direction_buttons, 10)
+    btn_average_x = Button(average_profile_direction_buttons[1, 1], label = "X -> YZ")
+    btn_average_y = Button(average_profile_direction_buttons[1, 2], label = "Y -> XZ")
+    btn_average_z = Button(average_profile_direction_buttons[1, 3], label = "Z -> XY")
+    average_profile_info = Label(average_profile_controls[3, 2], "", color = APP_TEXT_COLOR, visible = false)
     rowsize!(root_layout, 5, Fixed(0))
 
     export_controls = GridLayout(exports_panel[3, 1])
     colgap!(export_controls, 10)
     rowgap!(export_controls, 8)
-    export_path_caption = Label(export_controls[1, 1], "NetCDF path:", color = :black)
+    export_path_caption = Label(export_controls[1, 1], "NetCDF path:", color = APP_TEXT_COLOR)
     export_path_textbox = Textbox(
         export_controls[1, 2:4],
         stored_string = DEFAULT_NETCDF_EXPORT_PATH,
@@ -2081,7 +2060,7 @@ function main(;
     export_running = Observable(false)
     rowsize!(exports_panel, 3, Fixed(48))
 
-    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu)
+    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu)
 
     function close_menu!(menu)
         menu.is_open[] = false
@@ -2100,16 +2079,212 @@ function main(;
         end
     end
 
-    function active_render_fields()
-        return [field_name for field_name in render_field_names if render_checkbox_by_field[field_name].checked[]]
+    app_labels = Any[
+        dark_mode_caption,
+        render_checklist_title,
+        cloud_time_caption,
+        cloud_time_text,
+        cloud_speed_caption,
+        average_profile_note,
+        velocity_stress_note,
+        exports_title,
+        exports_status,
+        slice_field_caption,
+        slice_time_caption,
+        plane_caption,
+        z_caption,
+        z_text,
+        x_caption,
+        x_text,
+        y_caption,
+        y_text,
+        slice_info,
+        prime_field_caption,
+        prime_time_caption,
+        prime_time_text,
+        prime_formula,
+        prime_plane_caption,
+        prime_z_caption,
+        prime_z_text,
+        prime_x_caption,
+        prime_x_text,
+        prime_y_caption,
+        prime_y_text,
+        prime_info,
+        average_profile_field_caption,
+        average_profile_direction_caption,
+        average_profile_info,
+        export_path_caption,
+    ]
+    app_axes_2d = Any[ax_slice, ax_prime, ax_average_profile, collect(velocity_stress_axes)...]
+    app_colorbars = Any[cbar, cbar_prime, cbar_average_profile]
+    app_buttons = Any[
+        btn_cloud,
+        btn_slice,
+        btn_prime,
+        btn_average_profile,
+        btn_velocity_stress,
+        btn_exports,
+        cloud_play_button,
+        btn_xy,
+        btn_yz,
+        btn_xz,
+        btn_prime_xy,
+        btn_prime_yz,
+        btn_prime_xz,
+        btn_average_x,
+        btn_average_y,
+        btn_average_z,
+        export_button,
+    ]
+    app_menus = Any[cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu]
+    app_textboxes = Any[export_path_textbox]
+    app_checkboxes = Any[dark_mode_checkbox, values(render_checkbox_by_field)...]
+
+    function current_theme()
+        if dark_mode_checkbox.checked[]
+            return (
+                background = DARK_BACKGROUND,
+                text = DARK_TEXT_COLOR,
+                grid = DARK_GRID_COLOR,
+                button_active = DARK_BUTTON_ACTIVE,
+                button_inactive = DARK_BUTTON_INACTIVE,
+                button_hover = DARK_BUTTON_HOVER,
+                menu_background = DARK_MENU_BACKGROUND,
+                textbox_border = RGBf(0.42, 0.46, 0.54),
+            )
+        end
+
+        return (
+            background = LIGHT_BACKGROUND,
+            text = LIGHT_TEXT_COLOR,
+            grid = LIGHT_GRID_COLOR,
+            button_active = LIGHT_BUTTON_ACTIVE,
+            button_inactive = LIGHT_BUTTON_INACTIVE,
+            button_hover = LIGHT_BUTTON_HOVER,
+            menu_background = LIGHT_MENU_BACKGROUND,
+            textbox_border = RGBf(0.80, 0.80, 0.80),
+        )
     end
 
-    function update_render_info!()
-        idx = render_snapshot_index[]
-        step_kind = length(snapshots) == 1 ? "Snapshot" : "File timestep"
-        active_fields = active_render_fields()
-        field_text = isempty(active_fields) ? "no variables selected" : "rendering: " * join(active_fields, ", ")
-        cloud_info_text[] = "$(step_kind) $(time_label(snapshots[idx].time))   $(field_text)"
+    themed_button_color(is_active::Bool) = is_active ? current_theme().button_active : current_theme().button_inactive
+
+    function set_axis_theme!(ax, theme)
+        ax.backgroundcolor[] = theme.background
+        ax.titlecolor[] = theme.text
+        ax.xlabelcolor[] = theme.text
+        ax.ylabelcolor[] = theme.text
+        ax.xticklabelcolor[] = theme.text
+        ax.yticklabelcolor[] = theme.text
+        ax.xtickcolor[] = theme.text
+        ax.ytickcolor[] = theme.text
+        ax.xgridcolor[] = theme.grid
+        ax.ygridcolor[] = theme.grid
+        ax.bottomspinecolor[] = theme.text
+        ax.leftspinecolor[] = theme.text
+        ax.topspinecolor[] = theme.text
+        ax.rightspinecolor[] = theme.text
+    end
+
+    function set_axis3_theme!(ax, theme)
+        ax.backgroundcolor[] = theme.background
+        ax.titlecolor[] = theme.text
+        ax.xlabelcolor[] = theme.text
+        ax.ylabelcolor[] = theme.text
+        ax.zlabelcolor[] = theme.text
+        ax.xticklabelcolor[] = theme.text
+        ax.yticklabelcolor[] = theme.text
+        ax.zticklabelcolor[] = theme.text
+        ax.xtickcolor[] = theme.text
+        ax.ytickcolor[] = theme.text
+        ax.ztickcolor[] = theme.text
+    end
+
+    function set_colorbar_theme!(colorbar, theme)
+        colorbar.labelcolor[] = theme.text
+        colorbar.ticklabelcolor[] = theme.text
+        colorbar.tickcolor[] = theme.text
+        colorbar.bottomspinecolor[] = theme.text
+        colorbar.leftspinecolor[] = theme.text
+        colorbar.topspinecolor[] = theme.text
+        colorbar.rightspinecolor[] = theme.text
+    end
+
+    function set_button_theme!(button, theme)
+        button.labelcolor[] = theme.text
+        button.labelcolor_hover[] = theme.text
+        button.labelcolor_active[] = theme.text
+        button.buttoncolor[] = theme.button_inactive
+        button.buttoncolor_hover[] = theme.button_hover
+        button.buttoncolor_active[] = theme.button_active
+    end
+
+    function set_menu_theme!(menu, theme)
+        menu.textcolor[] = theme.text
+        menu.selection_cell_color_inactive[] = theme.menu_background
+        menu.cell_color_inactive_even[] = theme.menu_background
+        menu.cell_color_inactive_odd[] = theme.menu_background
+        menu.cell_color_hover[] = theme.button_hover
+        menu.cell_color_active[] = theme.button_active
+        menu.dropdown_arrow_color[] = RGBAf(theme.text.r, theme.text.g, theme.text.b, 0.55)
+
+        # Makie Menu creates these plots from initial color values, so update them directly.
+        menu.blockscene.backgroundcolor[] = theme.background
+        length(menu.blockscene.plots) >= 1 && (menu.blockscene.plots[1].color[] = theme.menu_background)
+        length(menu.blockscene.plots) >= 2 && (menu.blockscene.plots[2].color[] = theme.text)
+        length(menu.blockscene.plots) >= 3 && (menu.blockscene.plots[3].color[] = RGBAf(theme.text.r, theme.text.g, theme.text.b, 0.55))
+
+        if !isempty(menu.blockscene.children)
+            option_scene = menu.blockscene.children[1]
+            option_scene.backgroundcolor[] = theme.menu_background
+            length(option_scene.plots) >= 2 && (option_scene.plots[2].color[] = theme.text)
+        end
+    end
+
+    function set_textbox_theme!(textbox, theme)
+        textbox.textcolor[] = theme.text
+        textbox.boxcolor[] = theme.menu_background
+        textbox.boxcolor_hover[] = theme.menu_background
+        textbox.boxcolor_focused[] = theme.menu_background
+        textbox.bordercolor[] = theme.textbox_border
+    end
+
+    function set_checkbox_theme!(checkbox, theme)
+        checkbox.checkboxcolor_unchecked[] = theme.background
+        checkbox.checkboxstrokecolor_unchecked[] = theme.text
+    end
+
+    function apply_theme!()
+        theme = current_theme()
+
+        fig.scene.backgroundcolor[] = theme.background
+        for label in app_labels
+            label.color[] = theme.text
+        end
+        set_axis3_theme!(ax3d, theme)
+        for ax in app_axes_2d
+            set_axis_theme!(ax, theme)
+        end
+        for colorbar in app_colorbars
+            set_colorbar_theme!(colorbar, theme)
+        end
+        for button in app_buttons
+            set_button_theme!(button, theme)
+        end
+        for menu in app_menus
+            set_menu_theme!(menu, theme)
+        end
+        for textbox in app_textboxes
+            set_textbox_theme!(textbox, theme)
+        end
+        for checkbox in app_checkboxes
+            set_checkbox_theme!(checkbox, theme)
+        end
+
+        # Keep render checklist variable labels tied to their rendered field colors.
+        for field_name in render_field_names
+            render_checkbox_labels[field_name].color[] = render_variable_color(field_name)
+        end
     end
 
     function update_render_visibility!()
@@ -2123,10 +2298,8 @@ function main(;
     for field_name in render_field_names
         on(render_checkbox_by_field[field_name].checked) do _
             update_render_visibility!()
-            update_render_info!()
         end
     end
-    update_render_info!()
 
     render_playing = Observable(false)
     render_playback_task = Ref{Union{Task, Nothing}}(nothing)
@@ -2197,7 +2370,6 @@ function main(;
             render_rgba_by_field[field_name][] = get_render_frames(field_name)[idx].q_rgba
         end
         ax3d.title[] = render_axis_title(snapshots[idx].time)
-        update_render_info!()
     end
     on(x_slider.value) do v
         x_value[] = Float64(v)
@@ -2270,7 +2442,6 @@ function main(;
         cloud_speed_caption.visible[] = show_controls
         cloud_speed_menu.blockscene.visible[] = show_controls
         cloud_play_button.blockscene.visible[] = show_controls
-        cloud_info.visible[] = show_controls
         render_checklist_title.visible[] = show_controls
         for field_name in render_field_names
             render_checkbox_by_field[field_name].blockscene.visible[] = show_controls
@@ -2278,7 +2449,6 @@ function main(;
         end
 
         rowsize!(cloud_panel, 2, show_controls ? Fixed(42) : Fixed(0))
-        rowsize!(cloud_panel, 3, show_controls ? Fixed(24) : Fixed(0))
     end
 
     function set_slice_controls_visibility!(show_controls::Bool)
@@ -2296,7 +2466,7 @@ function main(;
         btn_xy.blockscene.visible[] = show_controls
         btn_yz.blockscene.visible[] = show_controls
         btn_xz.blockscene.visible[] = show_controls
-        slice_info.visible[] = show_controls
+        slice_info.visible[] = false
 
         z_caption.visible[] = is_xy
         z_slider.blockscene.visible[] = is_xy
@@ -2308,13 +2478,13 @@ function main(;
         y_slider.blockscene.visible[] = is_xz
         y_text.visible[] = is_xz
 
-        rowsize!(slice_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 3, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 4, is_xy ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 5, is_yz ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 6, is_xz ? Auto(0.12) : Fixed(0))
-        rowsize!(slice_controls, 7, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(slice_controls, 1, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(slice_controls, 2, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(slice_controls, 3, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(slice_controls, 4, is_xy ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(slice_controls, 5, is_yz ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(slice_controls, 6, is_xz ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(slice_controls, 7, Fixed(0))
     end
 
     function set_prime_controls_visibility!(show_controls::Bool)
@@ -2328,12 +2498,12 @@ function main(;
         prime_time_caption.visible[] = show_controls
         prime_time_slider.blockscene.visible[] = show_controls
         prime_time_text.visible[] = show_controls
-        prime_formula.visible[] = show_controls
+        prime_formula.visible[] = false
         prime_plane_caption.visible[] = show_controls
         btn_prime_xy.blockscene.visible[] = show_controls
         btn_prime_yz.blockscene.visible[] = show_controls
         btn_prime_xz.blockscene.visible[] = show_controls
-        prime_info.visible[] = show_controls
+        prime_info.visible[] = false
 
         prime_z_caption.visible[] = is_xy
         prime_z_slider.blockscene.visible[] = is_xy
@@ -2345,40 +2515,39 @@ function main(;
         prime_y_slider.blockscene.visible[] = is_xz
         prime_y_text.visible[] = is_xz
 
-        rowsize!(prime_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 3, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 4, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 5, is_xy ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 6, is_yz ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 7, is_xz ? Auto(0.12) : Fixed(0))
-        rowsize!(prime_controls, 8, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(prime_controls, 1, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(prime_controls, 2, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(prime_controls, 3, Fixed(0))
+        rowsize!(prime_controls, 4, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(prime_controls, 5, is_xy ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(prime_controls, 6, is_yz ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(prime_controls, 7, is_xz ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(prime_controls, 8, Fixed(0))
     end
 
     function set_average_profile_controls_visibility!(show_controls::Bool)
+        show_controls || close_menu!(average_profile_field_menu)
         average_profile_field_caption.visible[] = show_controls
-        for button in values(average_profile_field_buttons)
-            button.blockscene.visible[] = show_controls
-        end
+        average_profile_field_menu.blockscene.visible[] = show_controls
         average_profile_direction_caption.visible[] = show_controls
         btn_average_x.blockscene.visible[] = show_controls
         btn_average_y.blockscene.visible[] = show_controls
         btn_average_z.blockscene.visible[] = show_controls
-        average_profile_info.visible[] = show_controls
+        average_profile_info.visible[] = false
 
-        rowsize!(average_profile_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(average_profile_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
-        rowsize!(average_profile_controls, 3, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(average_profile_controls, 1, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(average_profile_controls, 2, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(average_profile_controls, 3, Fixed(0))
     end
 
     function set_export_controls_visibility!(show_controls::Bool)
-        exports_title.visible[] = show_controls
+        exports_title.visible[] = false
         exports_status.visible[] = show_controls
         export_path_caption.visible[] = show_controls
         export_path_textbox.blockscene.visible[] = show_controls
         export_button.blockscene.visible[] = show_controls
 
-        rowsize!(exports_panel, 1, show_controls ? Fixed(44) : Fixed(0))
+        rowsize!(exports_panel, 1, Fixed(0))
         rowsize!(exports_panel, 2, show_controls ? Fixed(32) : Fixed(0))
         rowsize!(exports_panel, 3, show_controls ? Fixed(48) : Fixed(0))
         rowsize!(export_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
@@ -2403,17 +2572,9 @@ function main(;
         )
     end
 
-    function update_average_profile_field_button_colors!()
-        for field_name in prime_field_names
-            average_profile_field_buttons[field_name].buttoncolor[] =
-                field_name == selected_average_profile_field[] ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        end
-    end
-
     function set_average_profile_field!(field_name)
         selected_average_profile_field[] = field_name
         update_average_profile_display!()
-        update_average_profile_field_button_colors!()
     end
 
     function set_slice_plane!(plane::Symbol)
@@ -2424,9 +2585,9 @@ function main(;
         slice_data = selected_slice_data[]
         field_name = selected_slice_field[]
 
-        btn_xy.buttoncolor[] = is_xy ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_yz.buttoncolor[] = is_yz ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_xz.buttoncolor[] = is_xz ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
+        btn_xy.buttoncolor[] = themed_button_color(is_xy)
+        btn_yz.buttoncolor[] = themed_button_color(is_yz)
+        btn_xz.buttoncolor[] = themed_button_color(is_xz)
 
         set_slice_controls_visibility!(current_view_mode[] == :slice)
 
@@ -2456,9 +2617,9 @@ function main(;
         prime_data = selected_prime_data[]
         field_name = selected_prime_field[]
 
-        btn_prime_xy.buttoncolor[] = is_xy ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_prime_yz.buttoncolor[] = is_yz ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_prime_xz.buttoncolor[] = is_xz ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
+        btn_prime_xy.buttoncolor[] = themed_button_color(is_xy)
+        btn_prime_yz.buttoncolor[] = themed_button_color(is_yz)
+        btn_prime_xz.buttoncolor[] = themed_button_color(is_xz)
 
         set_prime_controls_visibility!(current_view_mode[] == :prime)
 
@@ -2483,9 +2644,9 @@ function main(;
     function set_average_profile_direction!(direction::Symbol)
         average_profile_direction[] = direction
 
-        btn_average_x.buttoncolor[] = direction == :x ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_average_y.buttoncolor[] = direction == :y ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_average_z.buttoncolor[] = direction == :z ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
+        btn_average_x.buttoncolor[] = themed_button_color(direction == :x)
+        btn_average_y.buttoncolor[] = themed_button_color(direction == :y)
+        btn_average_z.buttoncolor[] = themed_button_color(direction == :z)
 
         set_average_profile_controls_visibility!(current_view_mode[] == :average_profile)
         update_average_profile_display!()
@@ -2516,7 +2677,7 @@ function main(;
         ax_average_profile.blockscene.visible[] = show_average_profile
         hm_average_profile.visible[] = show_average_profile
         cbar_average_profile.blockscene.visible[] = show_average_profile
-        average_profile_note.visible[] = show_average_profile
+        average_profile_note.visible[] = false
         for ax in velocity_stress_axes
             ax.scene.visible[] = show_velocity_stress
             ax.blockscene.visible[] = show_velocity_stress
@@ -2524,7 +2685,7 @@ function main(;
         for line in velocity_stress_lines
             line.visible[] = show_velocity_stress
         end
-        velocity_stress_note.visible[] = show_velocity_stress
+        velocity_stress_note.visible[] = false
 
         set_cloud_controls_visibility!(show_cloud)
         set_slice_controls_visibility!(show_slice)
@@ -2532,37 +2693,42 @@ function main(;
         set_average_profile_controls_visibility!(show_average_profile)
         set_export_controls_visibility!(show_exports)
 
-        btn_cloud.buttoncolor[] = show_cloud ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_slice.buttoncolor[] = show_slice ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_prime.buttoncolor[] = show_prime ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_average_profile.buttoncolor[] = show_average_profile ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_velocity_stress.buttoncolor[] = show_velocity_stress ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
-        btn_exports.buttoncolor[] = show_exports ? RGBf(0.85, 0.90, 0.98) : RGBf(0.80, 0.84, 0.90)
+        btn_cloud.buttoncolor[] = themed_button_color(show_cloud)
+        btn_slice.buttoncolor[] = themed_button_color(show_slice)
+        btn_prime.buttoncolor[] = themed_button_color(show_prime)
+        btn_average_profile.buttoncolor[] = themed_button_color(show_average_profile)
+        btn_velocity_stress.buttoncolor[] = themed_button_color(show_velocity_stress)
+        btn_exports.buttoncolor[] = themed_button_color(show_exports)
 
         if show_cloud
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
         elseif show_slice
-            rowsize!(root_layout, 3, Auto(0.16))
+            rowsize!(root_layout, 3, Fixed(CONTROL_PANEL_HEIGHT))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
             set_slice_plane!(slice_plane[])
         elseif show_prime
             rowsize!(root_layout, 3, Fixed(0))
-            rowsize!(root_layout, 4, Auto(0.18))
+            rowsize!(root_layout, 4, Fixed(CONTROL_PANEL_HEIGHT))
             rowsize!(root_layout, 5, Fixed(0))
             set_prime_slice_plane!(prime_slice_plane[])
         elseif show_average_profile
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
-            rowsize!(root_layout, 5, Auto(0.10))
+            rowsize!(root_layout, 5, Fixed(CONTROL_PANEL_HEIGHT))
             set_average_profile_direction!(average_profile_direction[])
         else
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
         end
+    end
+
+    on(dark_mode_checkbox.checked) do _
+        apply_theme!()
+        set_view_mode!(current_view_mode[])
     end
 
     on(export_button.clicks) do _
@@ -2573,7 +2739,7 @@ function main(;
 
         requested_path = export_path_textbox.displayed_string[]
         output_path = normalized_netcdf_output_path(requested_path)
-        export_status_text[] = "Exporting to $(output_path)..."
+        export_status_text[] = "Exporting..."
 
         @async begin
             try
@@ -2583,9 +2749,7 @@ function main(;
                     field_names = prime_field_names,
                     round_digits = ROUND_DIGITS,
                 )
-                field_text = join(["$(field.first)=>$(field.second)" for field in result.fields], ", ")
-                export_status_text[] =
-                    "Exported $(length(snapshot_series.snapshots)) timesteps and $(length(result.fields)) variables to $(result.path). Fields: $(field_text)"
+                export_status_text[] = "Export complete: $(result.path)"
             catch err
                 export_status_text[] = "Export failed: $(sprint(showerror, err))"
             finally
@@ -2595,12 +2759,10 @@ function main(;
         end
     end
 
-    for field_name in prime_field_names
-        let field_name = field_name
-            on(average_profile_field_buttons[field_name].clicks) do _
-                set_average_profile_field!(field_name)
-            end
-        end
+    on(average_profile_field_menu.selection) do field_name
+        isnothing(field_name) && return
+        close_menu!(average_profile_field_menu)
+        set_average_profile_field!(field_name)
     end
 
     on(btn_cloud.clicks) do _
@@ -2649,10 +2811,10 @@ function main(;
         set_average_profile_direction!(:z)
     end
 
+    apply_theme!()
     set_slice_plane!(:xy)
     set_prime_slice_plane!(:xy)
     set_average_profile_direction!(default_average_profile_direction)
-    update_average_profile_field_button_colors!()
     set_view_mode!(:slice)
 
     if display_figure
