@@ -6,8 +6,10 @@ GLMakie.activate!()
 
 const DATA_DIR = @__DIR__
 const DEFAULT_DATA_PATH = joinpath(DATA_DIR, "simulation.pvd")
+const DEFAULT_2D_DATA_DIR = joinpath(DATA_DIR, "2d")
 const DEFAULT_NETCDF_EXPORT_PATH = joinpath(DATA_DIR, "simulation.nc")
-const DEFAULT_FIELD_ORDER = ["ρ", "u", "v", "w", "θ", "θp"]
+const DEFAULT_2D_PNG_EXPORT_DIR = joinpath(DATA_DIR, "2d_png")
+const DEFAULT_FIELD_ORDER = ["ρ", "u", "v", "w", "p", "T", "θ", "θp"]
 const VELOCITY_COMPONENT_FIELD_NAMES = ["u", "v", "w"]
 const DEFAULT_VOLUME_FIELD_NAME = "θp"
 const DEFAULT_SLICE_FIELD_NAME = "θp"
@@ -18,6 +20,8 @@ const CONTINUOUS_SLIDER_SAMPLES = 5001
 const RENDER_PLAYBACK_SPEED_OPTIONS = ["1x", "2x", "4x"]
 const RENDER_PLAYBACK_INTERVAL_SECONDS = Dict("1x" => 1.0, "2x" => 0.5, "4x" => 0.25)
 const NETCDF_NAME_REPLACEMENTS = Dict("ρ" => "rho", "θ" => "theta", "θp" => "thetap")
+const PUBLICATION_2D_FIGURE_SIZE = (900, 720)
+const PUBLICATION_2D_PX_PER_UNIT = 3
 const RENDER_VARIABLE_COLORS = Dict(
     "ρ" => RGBf(0.95, 0.67, 0.16),
     "u" => RGBf(0.12, 0.47, 0.92),
@@ -65,6 +69,21 @@ struct SnapshotSeries
     snapshots::Vector{SnapshotState}
     mode::Symbol
     source_name::String
+end
+
+struct TwoDSnapshotSeries
+    axis_x::Vector{Float64}
+    axis_y::Vector{Float64}
+    points::Vector{Point2f}
+    faces::Vector{Makie.TriangleFace{Int}}
+    axis_x_label::String
+    axis_y_label::String
+    field_names::Vector{String}
+    base_snapshot::SnapshotState
+    snapshots::Vector{SnapshotState}
+    mode::Symbol
+    source_name::String
+    source_dir::String
 end
 
 struct CloudFrame
@@ -318,6 +337,172 @@ function dataset_entries(data_path)
     entries = [(time = entry.time, path = resolve_vtk_data_path(entry.path)) for entry in raw_entries]
     sort!(entries, by = entry -> entry.time)
     return entries
+end
+
+function parse_iteration_number(path)
+    match_result = match(r"iter_([0-9]+)", basename(path))
+    isnothing(match_result) && return nothing
+    return parse(Int, match_result.captures[1])
+end
+
+function vtk_entry_sort_key(path)
+    iteration = parse_iteration_number(path)
+    return (isnothing(iteration) ? typemax(Int) : iteration, basename(path))
+end
+
+function root_vtk_data_files(data_dir)
+    isdir(data_dir) || error("Could not find 2D data directory at $(data_dir).")
+
+    files = [
+        path for path in readdir(data_dir; join = true)
+        if isfile(path) && lowercase(splitext(path)[2]) in (".pvtu", ".vtu")
+    ]
+    sort!(files, by = vtk_entry_sort_key)
+    return files
+end
+
+function two_d_dataset_entries(data_path)
+    if isdir(data_path)
+        pvd_path = joinpath(data_path, "simulation.pvd")
+        if isfile(pvd_path)
+            raw_entries = parse_pvd_entries(pvd_path)
+            entries = [
+                (
+                    time = entry.time,
+                    label = time_label(entry.time),
+                    path = resolve_vtk_data_path(entry.path),
+                ) for entry in raw_entries
+            ]
+            sort!(entries, by = entry -> entry.time)
+            return entries
+        end
+
+        files = root_vtk_data_files(data_path)
+        isempty(files) && error("No .pvtu or .vtu files were found at the top level of $(data_path).")
+
+        return [
+            (
+                time = Float64(something(parse_iteration_number(path), idx - 1)),
+                label = splitext(basename(path))[1],
+                path = resolve_vtk_data_path(path),
+            ) for (idx, path) in enumerate(files)
+        ]
+    end
+
+    isfile(data_path) || error("Could not find 2D data file or directory at $(data_path).")
+    ext = lowercase(splitext(data_path)[2])
+    if ext == ".pvd"
+        raw_entries = parse_pvd_entries(data_path)
+        entries = [
+            (
+                time = entry.time,
+                label = time_label(entry.time),
+                path = resolve_vtk_data_path(entry.path),
+            ) for entry in raw_entries
+        ]
+        sort!(entries, by = entry -> entry.time)
+        return entries
+    elseif ext in (".pvtu", ".vtu")
+        iteration = parse_iteration_number(data_path)
+        return [(
+            time = Float64(something(iteration, 0)),
+            label = splitext(basename(data_path))[1],
+            path = resolve_vtk_data_path(data_path),
+        )]
+    end
+
+    error("Unsupported 2D data path extension $(repr(ext)) for $(data_path). Expected a directory, .pvd, .pvtu, or .vtu.")
+end
+
+function two_d_axis_indices(x, y, z; round_digits = ROUND_DIGITS)
+    coords = (x, y, z)
+    unique_counts = [
+        length(unique(rounded_grid_coordinates(coord; round_digits = round_digits)))
+        for coord in coords
+    ]
+    varying_axes = findall(count -> count > 1, unique_counts)
+    length(varying_axes) >= 2 || error("2D data must vary along at least two coordinate axes.")
+
+    ranked_axes = sort(varying_axes, by = axis -> (-unique_counts[axis], axis))
+    return Tuple(sort(ranked_axes[1:2]))
+end
+
+function two_d_axis_label(axis_index)
+    axis_name = axis_index == 1 ? "x" : axis_index == 2 ? "y" : "z"
+    return "$(axis_name) (m)"
+end
+
+function two_d_points(x, y, z, axis_indices)
+    coords = (Float64.(x), Float64.(y), Float64.(z))
+    axis_x_index, axis_y_index = axis_indices
+    return [
+        Point2f(Float32(coords[axis_x_index][i]), Float32(coords[axis_y_index][i]))
+        for i in eachindex(coords[1])
+    ]
+end
+
+function vtk_triangle_faces(vtu_path)
+    vtk = VTKFile(vtu_path)
+    mesh_cells = ReadVTK.to_meshcells(get_cells(vtk))
+    faces = Makie.TriangleFace{Int}[]
+
+    for cell in mesh_cells
+        conn = cell.connectivity
+        length(conn) >= 3 || continue
+
+        if length(conn) == 3
+            push!(faces, Makie.TriangleFace{Int}(conn[1], conn[2], conn[3]))
+        else
+            for i in 2:(length(conn) - 1)
+                push!(faces, Makie.TriangleFace{Int}(conn[1], conn[i], conn[i + 1]))
+            end
+        end
+    end
+
+    isempty(faces) && error("No 2D triangle faces could be built from $(vtu_path).")
+    return faces
+end
+
+function load_2d_snapshot_series(data_path = DEFAULT_2D_DATA_DIR)
+    entries = two_d_dataset_entries(data_path)
+    first_entry = first(entries)
+    x, y, z, point_data = load_point_dataset(first_entry.path)
+    field_names = point_field_names(point_data)
+    axis_indices = two_d_axis_indices(x, y, z; round_digits = ROUND_DIGITS)
+    points = two_d_points(x, y, z, axis_indices)
+    faces = vtk_triangle_faces(first_entry.path)
+    base_fields = point_field_value_dict(point_data; field_names = field_names)
+    base_snapshot = SnapshotState(first_entry.time, first_entry.label, base_fields)
+
+    snapshots = SnapshotState[base_snapshot]
+    for entry in entries[2:end]
+        xi, yi, zi, point_data_i = load_point_dataset(entry.path)
+        require_matching_coordinates(x, y, z, xi, yi, zi, entry.path)
+        require_point_fields(point_data_i, field_names)
+        faces_i = vtk_triangle_faces(entry.path)
+        faces_i == faces || error("2D mesh connectivity in $(entry.path) does not match the first 2D timestep.")
+        push!(snapshots, SnapshotState(
+            entry.time,
+            entry.label,
+            point_field_value_dict(point_data_i; field_names = field_names),
+        ))
+    end
+
+    source_name = isdir(data_path) ? basename(normpath(data_path)) : basename(data_path)
+    return TwoDSnapshotSeries(
+        Float64.([point[1] for point in points]),
+        Float64.([point[2] for point in points]),
+        points,
+        faces,
+        two_d_axis_label(axis_indices[1]),
+        two_d_axis_label(axis_indices[2]),
+        field_names,
+        base_snapshot,
+        snapshots,
+        length(snapshots) > 1 ? :timeseries : :single,
+        source_name,
+        isdir(data_path) ? normpath(data_path) : dirname(normpath(data_path)),
+    )
 end
 
 function matching_coordinates(a, b)
@@ -683,6 +868,188 @@ function export_snapshot_series_to_netcdf(snapshot_series::SnapshotSeries, outpu
         path = final_output_path,
         fields = field_name_map,
         dimensions = dimensions,
+    )
+end
+
+function normalized_2d_png_output_dir(path)
+    cleaned_path = strip(String(path))
+    isempty(cleaned_path) && (cleaned_path = DEFAULT_2D_PNG_EXPORT_DIR)
+    output_dir = isabspath(cleaned_path) ? cleaned_path : joinpath(DATA_DIR, cleaned_path)
+    return normpath(output_dir)
+end
+
+function plot_file_component(value)
+    text = String(value)
+    text = get(NETCDF_NAME_REPLACEMENTS, text, text)
+    buffer = IOBuffer()
+
+    for c in text
+        if isascii(c) && (isletter(c) || isdigit(c) || c == '_' || c == '-' || c == '.')
+            print(buffer, c)
+        elseif isspace(c)
+            print(buffer, '_')
+        else
+            print(buffer, "_u", lpad(string(Int(c), base = 16), 4, '0'))
+        end
+    end
+
+    component = String(take!(buffer))
+    isempty(component) && return "value"
+    return component
+end
+
+function two_d_plot_title(field_name, snapshot::SnapshotState)
+    return "$(field_name), $(snapshot.label)"
+end
+
+function two_d_axis_limits(values)
+    lo = Float64(minimum(values))
+    hi = Float64(maximum(values))
+    if lo == hi
+        pad = max(abs(lo) * 0.05, 1e-6)
+        return lo - pad, hi + pad
+    end
+
+    pad = 0.02 * (hi - lo)
+    return lo - pad, hi + pad
+end
+
+function build_2d_publication_figure(
+    two_d_series::TwoDSnapshotSeries,
+    snapshot::SnapshotState,
+    field_name;
+    colormap = :viridis,
+    colorrange = (-1f0, 1f0),
+)
+    require_fields(snapshot.fields, [field_name])
+
+    fig = Figure(
+        size = PUBLICATION_2D_FIGURE_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        fontsize = 20,
+    )
+    ax = Axis(
+        fig[1, 1],
+        title = two_d_plot_title(field_name, snapshot),
+        xlabel = two_d_series.axis_x_label,
+        ylabel = two_d_series.axis_y_label,
+        aspect = DataAspect(),
+        titlesize = 24,
+        xlabelsize = 20,
+        ylabelsize = 20,
+        xticklabelsize = 16,
+        yticklabelsize = 16,
+        backgroundcolor = RGBf(1, 1, 1),
+        titlecolor = RGBf(0, 0, 0),
+        xlabelcolor = RGBf(0, 0, 0),
+        ylabelcolor = RGBf(0, 0, 0),
+        xticklabelcolor = RGBf(0, 0, 0),
+        yticklabelcolor = RGBf(0, 0, 0),
+        xtickcolor = RGBf(0, 0, 0),
+        ytickcolor = RGBf(0, 0, 0),
+        xgridcolor = RGBAf(0, 0, 0, 0.12),
+        ygridcolor = RGBAf(0, 0, 0, 0.12),
+    )
+    plot = mesh!(
+        ax,
+        two_d_series.points,
+        two_d_series.faces;
+        color = snapshot.fields[field_name],
+        colormap = colormap,
+        colorrange = colorrange,
+        shading = NoShading,
+    )
+    colorbar = Colorbar(
+        fig[1, 2],
+        plot;
+        label = field_name,
+        width = 24,
+        labelsize = 20,
+        ticklabelsize = 16,
+        labelcolor = RGBf(0, 0, 0),
+        ticklabelcolor = RGBf(0, 0, 0),
+        tickcolor = RGBf(0, 0, 0),
+    )
+    colorbar.bottomspinecolor[] = RGBf(0, 0, 0)
+    colorbar.leftspinecolor[] = RGBf(0, 0, 0)
+    colorbar.topspinecolor[] = RGBf(0, 0, 0)
+    colorbar.rightspinecolor[] = RGBf(0, 0, 0)
+
+    xlo, xhi = two_d_axis_limits(two_d_series.axis_x)
+    ylo, yhi = two_d_axis_limits(two_d_series.axis_y)
+    limits!(ax, xlo, xhi, ylo, yhi)
+    return fig
+end
+
+function export_2d_plots_to_png(
+    two_d_series::TwoDSnapshotSeries,
+    output_dir;
+    field_names = two_d_series.field_names,
+    px_per_unit = PUBLICATION_2D_PX_PER_UNIT,
+)
+    isempty(two_d_series.snapshots) && error("Cannot export PNGs from an empty 2D snapshot series.")
+    isempty(field_names) && error("Cannot export PNGs without 2D point-data fields.")
+
+    final_output_dir = normalized_2d_png_output_dir(output_dir)
+    mkpath(final_output_dir)
+    field_style_by_field = Dict(
+        field_name => global_field_colormap_and_range(two_d_series.snapshots, field_name)
+        for field_name in field_names
+    )
+    exported_paths = String[]
+
+    for snapshot in two_d_series.snapshots
+        snapshot_component = plot_file_component(snapshot.label)
+        for field_name in field_names
+            colormap, colorrange = field_style_by_field[field_name]
+            fig = build_2d_publication_figure(
+                two_d_series,
+                snapshot,
+                field_name;
+                colormap = colormap,
+                colorrange = colorrange,
+            )
+            filename = "$(snapshot_component)_$(plot_file_component(field_name)).png"
+            output_path = joinpath(final_output_dir, filename)
+            save(output_path, fig; px_per_unit = px_per_unit)
+            push!(exported_paths, output_path)
+        end
+    end
+
+    return (
+        dir = final_output_dir,
+        paths = exported_paths,
+    )
+end
+
+function export_2d_plots_to_png_subprocess(
+    output_dir;
+    data_path = DEFAULT_2D_DATA_DIR,
+    field_names = nothing,
+    px_per_unit = PUBLICATION_2D_PX_PER_UNIT,
+)
+    final_output_dir = normalized_2d_png_output_dir(output_dir)
+    tool_path = normpath(@__FILE__)
+    field_names_expr = isnothing(field_names) ? "s.field_names" : repr(collect(field_names))
+    script = """
+        include($(repr(tool_path)))
+        s = load_2d_snapshot_series($(repr(data_path)))
+        result = export_2d_plots_to_png(
+            s,
+            $(repr(final_output_dir));
+            field_names = $(field_names_expr),
+            px_per_unit = $(Int(px_per_unit)),
+        )
+        println(length(result.paths))
+    """
+
+    output = read(`$(Base.julia_cmd()) --startup-file=no -e $script`, String)
+    output_lines = [strip(line) for line in split(output, '\n') if !isempty(strip(line))]
+    isempty(output_lines) && error("2D PNG export subprocess did not report an exported file count.")
+    exported_count = parse(Int, last(output_lines))
+    return (
+        dir = final_output_dir,
+        count = exported_count,
     )
 end
 
@@ -1444,6 +1811,18 @@ function main(;
     default_average_profile_direction = :z
     default_average_profile_data = get_average_profile_data(default_average_profile_field_name, default_average_profile_direction)
 
+    if display_figure
+        println("Loading 2D VTK data from $(DEFAULT_2D_DATA_DIR)...")
+    end
+    two_d_series = load_2d_snapshot_series(DEFAULT_2D_DATA_DIR)
+    two_d_field_style_by_field = Dict(
+        field_name => global_field_colormap_and_range(two_d_series.snapshots, field_name)
+        for field_name in two_d_series.field_names
+    )
+    default_2d_field_name = first(two_d_series.field_names)
+    default_2d_snapshot_index = 1
+    default_2d_snapshot = two_d_series.snapshots[default_2d_snapshot_index]
+
     fig = Figure(size = (1500, 860), backgroundcolor = APP_BACKGROUND)
     colsize!(fig.layout, 1, Relative(1))
     rowsize!(fig.layout, 1, Relative(1))
@@ -1456,11 +1835,12 @@ function main(;
     btn_cloud = Button(toolbar[1, 1], label = "3D Volume")
     btn_slice = Button(toolbar[1, 2], label = "Slices")
     btn_prime = Button(toolbar[1, 3], label = "Variable'")
-    btn_average_profile = Button(toolbar[1, 4], label = "2D Mean")
+    btn_average_profile = Button(toolbar[1, 4], label = "Mean Profiles")
     btn_velocity_stress = Button(toolbar[1, 5], label = "u'v'w'")
     btn_exports = Button(toolbar[1, 6], label = "Exports")
-    dark_mode_caption = Label(toolbar[1, 7], "Dark mode:", color = APP_TEXT_COLOR)
-    dark_mode_checkbox = Checkbox(toolbar[1, 8]; checked = false)
+    btn_2d_data = Button(toolbar[1, 7], label = "2D Data")
+    dark_mode_caption = Label(toolbar[1, 8], "Dark mode:", color = APP_TEXT_COLOR)
+    dark_mode_checkbox = Checkbox(toolbar[1, 9]; checked = false)
     colgap!(toolbar, 10)
 
     main_layout = GridLayout(
@@ -1480,6 +1860,7 @@ function main(;
     slice_panel = GridLayout(main_layout[1, 1])
     prime_panel = GridLayout(main_layout[1, 1])
     average_profile_panel = GridLayout(main_layout[1, 1])
+    two_d_panel = GridLayout(main_layout[1, 1])
     exports_panel = GridLayout(
         main_layout[1, 1];
         width = Relative(1),
@@ -1500,14 +1881,17 @@ function main(;
     )
     colgap!(slice_panel, 12)
     colgap!(average_profile_panel, 12)
+    colgap!(two_d_panel, 12)
     colgap!(exports_panel, 12)
     colgap!(velocity_stress_panel, 8)
     rowgap!(cloud_panel, 10)
     rowgap!(average_profile_panel, 6)
+    rowgap!(two_d_panel, 6)
     rowgap!(exports_panel, 10)
     rowgap!(velocity_stress_panel, 6)
     colsize!(slice_panel, 1, Relative(1))
     colsize!(average_profile_panel, 1, Relative(1))
+    colsize!(two_d_panel, 1, Relative(1))
     colsize!(exports_panel, 1, Relative(1))
     colsize!(cloud_panel, 1, Relative(1))
 
@@ -1838,6 +2222,65 @@ function main(;
     )
     rowsize!(average_profile_panel, 2, Fixed(0))
 
+    selected_2d_field = Observable(default_2d_field_name)
+    two_d_snapshot_index = Observable(default_2d_snapshot_index)
+    selected_2d_snapshot = Observable(default_2d_snapshot)
+    two_d_plot_values = lift(selected_2d_snapshot, selected_2d_field) do snapshot, field_name
+        snapshot.fields[field_name]
+    end
+    two_d_colormap = lift(selected_2d_field) do field_name
+        two_d_field_style_by_field[field_name][1]
+    end
+    two_d_colorrange = lift(selected_2d_field) do field_name
+        two_d_field_style_by_field[field_name][2]
+    end
+
+    ax_2d = Axis(
+        two_d_panel[1, 1],
+        title = two_d_plot_title(default_2d_field_name, default_2d_snapshot),
+        xlabel = two_d_series.axis_x_label,
+        ylabel = two_d_series.axis_y_label,
+        aspect = DataAspect(),
+        backgroundcolor = APP_BACKGROUND,
+        titlecolor = APP_TEXT_COLOR,
+        xlabelcolor = APP_TEXT_COLOR,
+        ylabelcolor = APP_TEXT_COLOR,
+        xticklabelcolor = APP_TEXT_COLOR,
+        yticklabelcolor = APP_TEXT_COLOR,
+        xtickcolor = APP_TEXT_COLOR,
+        ytickcolor = APP_TEXT_COLOR,
+        xgridcolor = APP_GRID_COLOR,
+        ygridcolor = APP_GRID_COLOR,
+    )
+    mesh_2d = mesh!(
+        ax_2d,
+        two_d_series.points,
+        two_d_series.faces;
+        color = two_d_plot_values,
+        colormap = two_d_colormap,
+        colorrange = two_d_colorrange,
+        shading = NoShading,
+    )
+    cbar_2d = Colorbar(
+        two_d_panel[1, 2],
+        mesh_2d,
+        label = selected_2d_field,
+        width = 20,
+    )
+    cbar_2d.labelcolor = APP_TEXT_COLOR
+    cbar_2d.ticklabelcolor = APP_TEXT_COLOR
+    cbar_2d.tickcolor = APP_TEXT_COLOR
+    two_d_xlo, two_d_xhi = two_d_axis_limits(two_d_series.axis_x)
+    two_d_ylo, two_d_yhi = two_d_axis_limits(two_d_series.axis_y)
+    limits!(ax_2d, two_d_xlo, two_d_xhi, two_d_ylo, two_d_yhi)
+    two_d_note = Label(
+        two_d_panel[2, 1:2],
+        "",
+        color = APP_TEXT_COLOR,
+        visible = false,
+    )
+    rowsize!(two_d_panel, 2, Fixed(0))
+
     velocity_stress_axes = Matrix{Any}(undef, 3, 3)
     velocity_stress_lines = Matrix{Any}(undef, 3, 3)
     velocity_stress_scale = maximum(profile_maxabs(profile[.!isnan.(profile)]) for profile in velocity_stress_data.profiles)
@@ -2047,6 +2490,46 @@ function main(;
     average_profile_info = Label(average_profile_controls[3, 2], "", color = APP_TEXT_COLOR, visible = false)
     rowsize!(root_layout, 5, Fixed(0))
 
+    two_d_controls = GridLayout(root_layout[6, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
+    colgap!(two_d_controls, 10)
+    rowgap!(two_d_controls, 8)
+    colsize!(two_d_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
+
+    two_d_field_caption = Label(two_d_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_field_menu = Menu(
+        two_d_controls[1, 2],
+        options = two_d_series.field_names,
+        default = default_2d_field_name,
+        width = 360,
+        direction = :down,
+    )
+    two_d_time_caption = Label(two_d_controls[2, 1], "2D file:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_time_row = GridLayout(two_d_controls[2, 2]; tellwidth = false, halign = :left)
+    colgap!(two_d_time_row, 10)
+    two_d_time_slider = Slider(
+        two_d_time_row[1, 1],
+        range = 0:(length(two_d_series.snapshots) - 1),
+        startvalue = 0,
+        width = CONTROL_SLIDER_WIDTH,
+        snap = true,
+    )
+    two_d_time_text = Label(two_d_time_row[1, 2], lift(two_d_snapshot_index) do idx
+        two_d_series.snapshots[idx].label
+    end, color = APP_TEXT_COLOR)
+    two_d_export_path_caption = Label(two_d_controls[3, 1], "PNG folder:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_export_row = GridLayout(two_d_controls[3, 2]; tellwidth = false, halign = :left)
+    colgap!(two_d_export_row, 10)
+    two_d_export_path_textbox = Textbox(
+        two_d_export_row[1, 1],
+        stored_string = DEFAULT_2D_PNG_EXPORT_DIR,
+        width = CONTROL_SLIDER_WIDTH,
+    )
+    two_d_export_button = Button(two_d_export_row[1, 2], label = "Export PNGs", width = 140)
+    two_d_export_status_text = Observable("")
+    two_d_export_status = Label(two_d_controls[4, 2], two_d_export_status_text, color = APP_TEXT_COLOR, visible = false)
+    two_d_export_running = Observable(false)
+    rowsize!(root_layout, 6, Fixed(0))
+
     export_controls = GridLayout(exports_panel[3, 1])
     colgap!(export_controls, 10)
     rowgap!(export_controls, 8)
@@ -2060,7 +2543,7 @@ function main(;
     export_running = Observable(false)
     rowsize!(exports_panel, 3, Fixed(48))
 
-    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu)
+    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu)
 
     function close_menu!(menu)
         menu.is_open[] = false
@@ -2114,15 +2597,22 @@ function main(;
         average_profile_field_caption,
         average_profile_direction_caption,
         average_profile_info,
+        two_d_note,
+        two_d_field_caption,
+        two_d_time_caption,
+        two_d_time_text,
+        two_d_export_path_caption,
+        two_d_export_status,
         export_path_caption,
     ]
-    app_axes_2d = Any[ax_slice, ax_prime, ax_average_profile, collect(velocity_stress_axes)...]
-    app_colorbars = Any[cbar, cbar_prime, cbar_average_profile]
+    app_axes_2d = Any[ax_slice, ax_prime, ax_average_profile, ax_2d, collect(velocity_stress_axes)...]
+    app_colorbars = Any[cbar, cbar_prime, cbar_average_profile, cbar_2d]
     app_buttons = Any[
         btn_cloud,
         btn_slice,
         btn_prime,
         btn_average_profile,
+        btn_2d_data,
         btn_velocity_stress,
         btn_exports,
         cloud_play_button,
@@ -2135,10 +2625,11 @@ function main(;
         btn_average_x,
         btn_average_y,
         btn_average_z,
+        two_d_export_button,
         export_button,
     ]
-    app_menus = Any[cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu]
-    app_textboxes = Any[export_path_textbox]
+    app_menus = Any[cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu]
+    app_textboxes = Any[export_path_textbox, two_d_export_path_textbox]
     app_checkboxes = Any[dark_mode_checkbox, values(render_checkbox_by_field)...]
 
     function current_theme()
@@ -2540,6 +3031,25 @@ function main(;
         rowsize!(average_profile_controls, 3, Fixed(0))
     end
 
+    function set_2d_controls_visibility!(show_controls::Bool)
+        show_controls || close_menu!(two_d_field_menu)
+        two_d_field_caption.visible[] = show_controls
+        two_d_field_menu.blockscene.visible[] = show_controls
+        two_d_time_caption.visible[] = show_controls
+        two_d_time_slider.blockscene.visible[] = show_controls
+        two_d_time_text.visible[] = show_controls
+        two_d_export_path_caption.visible[] = show_controls
+        two_d_export_path_textbox.blockscene.visible[] = show_controls
+        two_d_export_button.blockscene.visible[] = show_controls
+        two_d_export_status.visible[] = show_controls
+        two_d_note.visible[] = false
+
+        rowsize!(two_d_controls, 1, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(two_d_controls, 2, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(two_d_controls, 3, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+        rowsize!(two_d_controls, 4, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+    end
+
     function set_export_controls_visibility!(show_controls::Bool)
         exports_title.visible[] = false
         exports_status.visible[] = show_controls
@@ -2575,6 +3085,17 @@ function main(;
     function set_average_profile_field!(field_name)
         selected_average_profile_field[] = field_name
         update_average_profile_display!()
+    end
+
+    function update_2d_plot_display!()
+        field_name = selected_2d_field[]
+        snapshot = selected_2d_snapshot[]
+        ax_2d.title[] = two_d_plot_title(field_name, snapshot)
+    end
+
+    function set_2d_field!(field_name)
+        selected_2d_field[] = field_name
+        update_2d_plot_display!()
     end
 
     function set_slice_plane!(plane::Symbol)
@@ -2658,6 +3179,7 @@ function main(;
         show_slice = mode == :slice
         show_prime = mode == :prime
         show_average_profile = mode == :average_profile
+        show_2d_data = mode == :two_d_data
         show_velocity_stress = mode == :velocity_stress
         show_exports = mode == :exports
 
@@ -2678,6 +3200,11 @@ function main(;
         hm_average_profile.visible[] = show_average_profile
         cbar_average_profile.blockscene.visible[] = show_average_profile
         average_profile_note.visible[] = false
+        ax_2d.scene.visible[] = show_2d_data
+        ax_2d.blockscene.visible[] = show_2d_data
+        mesh_2d.visible[] = show_2d_data
+        cbar_2d.blockscene.visible[] = show_2d_data
+        two_d_note.visible[] = false
         for ax in velocity_stress_axes
             ax.scene.visible[] = show_velocity_stress
             ax.blockscene.visible[] = show_velocity_stress
@@ -2691,12 +3218,14 @@ function main(;
         set_slice_controls_visibility!(show_slice)
         set_prime_controls_visibility!(show_prime)
         set_average_profile_controls_visibility!(show_average_profile)
+        set_2d_controls_visibility!(show_2d_data)
         set_export_controls_visibility!(show_exports)
 
         btn_cloud.buttoncolor[] = themed_button_color(show_cloud)
         btn_slice.buttoncolor[] = themed_button_color(show_slice)
         btn_prime.buttoncolor[] = themed_button_color(show_prime)
         btn_average_profile.buttoncolor[] = themed_button_color(show_average_profile)
+        btn_2d_data.buttoncolor[] = themed_button_color(show_2d_data)
         btn_velocity_stress.buttoncolor[] = themed_button_color(show_velocity_stress)
         btn_exports.buttoncolor[] = themed_button_color(show_exports)
 
@@ -2704,25 +3233,36 @@ function main(;
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
+            rowsize!(root_layout, 6, Fixed(0))
         elseif show_slice
             rowsize!(root_layout, 3, Fixed(CONTROL_PANEL_HEIGHT))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
+            rowsize!(root_layout, 6, Fixed(0))
             set_slice_plane!(slice_plane[])
         elseif show_prime
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(CONTROL_PANEL_HEIGHT))
             rowsize!(root_layout, 5, Fixed(0))
+            rowsize!(root_layout, 6, Fixed(0))
             set_prime_slice_plane!(prime_slice_plane[])
         elseif show_average_profile
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(CONTROL_PANEL_HEIGHT))
+            rowsize!(root_layout, 6, Fixed(0))
             set_average_profile_direction!(average_profile_direction[])
+        elseif show_2d_data
+            rowsize!(root_layout, 3, Fixed(0))
+            rowsize!(root_layout, 4, Fixed(0))
+            rowsize!(root_layout, 5, Fixed(0))
+            rowsize!(root_layout, 6, Fixed(CONTROL_PANEL_HEIGHT))
+            update_2d_plot_display!()
         else
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
+            rowsize!(root_layout, 6, Fixed(0))
         end
     end
 
@@ -2765,6 +3305,51 @@ function main(;
         set_average_profile_field!(field_name)
     end
 
+    on(two_d_time_slider.value) do v
+        idx = Int(v) + 1
+        two_d_snapshot_index[] = idx
+        selected_2d_snapshot[] = two_d_series.snapshots[idx]
+        update_2d_plot_display!()
+    end
+
+    on(two_d_field_menu.selection) do field_name
+        isnothing(field_name) && return
+        close_menu!(two_d_field_menu)
+        set_2d_field!(field_name)
+    end
+
+    on(two_d_export_button.clicks) do _
+        two_d_export_running[] && return
+
+        two_d_export_running[] = true
+        two_d_export_button.label[] = "Exporting..."
+
+        requested_dir = two_d_export_path_textbox.displayed_string[]
+        output_dir = normalized_2d_png_output_dir(requested_dir)
+        two_d_export_status_text[] = "Exporting..."
+
+        @async begin
+            try
+                result = export_2d_plots_to_png_subprocess(
+                    output_dir;
+                    data_path = DEFAULT_2D_DATA_DIR,
+                    field_names = two_d_series.field_names,
+                    px_per_unit = PUBLICATION_2D_PX_PER_UNIT,
+                )
+                two_d_export_status_text[] = "Export complete: $(result.count) PNGs in $(result.dir)"
+            catch err
+                two_d_export_status_text[] = "Export failed: $(sprint(showerror, err))"
+            finally
+                two_d_export_button.label[] = "Export PNGs"
+                two_d_export_running[] = false
+                if !isnothing(LAST_FIGURE[])
+                    LAST_SCREEN[] = display(LAST_FIGURE[])
+                    set_view_mode!(current_view_mode[])
+                end
+            end
+        end
+    end
+
     on(btn_cloud.clicks) do _
         set_view_mode!(:cloud)
     end
@@ -2776,6 +3361,9 @@ function main(;
     end
     on(btn_average_profile.clicks) do _
         set_view_mode!(:average_profile)
+    end
+    on(btn_2d_data.clicks) do _
+        set_view_mode!(:two_d_data)
     end
     on(btn_velocity_stress.clicks) do _
         set_view_mode!(:velocity_stress)
@@ -2815,6 +3403,7 @@ function main(;
     set_slice_plane!(:xy)
     set_prime_slice_plane!(:xy)
     set_average_profile_direction!(default_average_profile_direction)
+    update_2d_plot_display!()
     set_view_mode!(:slice)
 
     if display_figure
@@ -2836,6 +3425,6 @@ if isinteractive()
             Base.display_error(stderr, err, catch_backtrace())
         end
     end
-else
+elseif abspath(PROGRAM_FILE) == abspath(@__FILE__)
     main(wait_for_window = true)
 end
