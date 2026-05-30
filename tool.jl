@@ -4,6 +4,19 @@ using Statistics
 
 GLMakie.activate!()
 
+# Makie 0.24 bounding-box mouse handlers do not check whether their block scene is
+# hidden. Collapsed tab layouts can overlap, so invisible controls otherwise
+# consume pointer events before the visible controls receive them.
+function Makie.addmouseevents!(
+    scene::Makie.Scene,
+    bbox::Makie.Observables.AbstractObservable{<:Makie.Rect2};
+    priority = 1,
+)
+    is_mouse_over_relevant_area() =
+        scene.visible[] && Makie.mouseposition_px(scene) in bbox[]
+    return Makie._addmouseevents!(scene, is_mouse_over_relevant_area, priority)
+end
+
 const DATA_DIR = @__DIR__
 const DEFAULT_DATA_PATH = joinpath(DATA_DIR, "simulation.pvd")
 const DEFAULT_2D_DATA_DIR = joinpath(DATA_DIR, "2d")
@@ -47,10 +60,25 @@ const DARK_MENU_BACKGROUND = RGBf(0.11, 0.12, 0.15)
 const APP_BACKGROUND = LIGHT_BACKGROUND
 const APP_TEXT_COLOR = LIGHT_TEXT_COLOR
 const APP_GRID_COLOR = LIGHT_GRID_COLOR
-const CONTROL_LABEL_WIDTH = 160
-const CONTROL_ROW_HEIGHT = 40
-const CONTROL_SLIDER_WIDTH = 560
-const CONTROL_PANEL_HEIGHT = 320
+const APP_FIGURE_SIZE = (1700, 1000)
+const APP_FONT_SIZE = 20
+const AXIS_TITLE_SIZE = 26
+const AXIS_LABEL_SIZE = 22
+const AXIS_TICK_LABEL_SIZE = 18
+const AXIS_TICK_TARGET_SPACING = 110
+const AXIS_TICK_MIN_COUNT = 2
+const AXIS_TICK_MAX_COUNT = 10
+const COLORBAR_LABEL_SIZE = 20
+const COLORBAR_TICK_LABEL_SIZE = 17
+const TOOLBAR_HEIGHT = 54
+const CONTROL_LABEL_WIDTH = 190
+const CONTROL_ROW_HEIGHT = 44
+const CONTROL_ROW_GAP = 8
+const CONTROL_SLIDER_WIDTH = 680
+const SLICE_CONTROL_PANEL_HEIGHT = 4 * CONTROL_ROW_HEIGHT + 6 * CONTROL_ROW_GAP
+const PRIME_CONTROL_PANEL_HEIGHT = 4 * CONTROL_ROW_HEIGHT + 7 * CONTROL_ROW_GAP
+const AVERAGE_PROFILE_CONTROL_PANEL_HEIGHT = 2 * CONTROL_ROW_HEIGHT + 2 * CONTROL_ROW_GAP
+const TWO_D_CONTROL_PANEL_HEIGHT = 4 * CONTROL_ROW_HEIGHT + 3 * CONTROL_ROW_GAP
 const LAST_FIGURE = Ref{Any}(nothing)
 const LAST_SCREEN = Ref{Any}(nothing)
 
@@ -926,7 +954,7 @@ function build_2d_publication_figure(
     fig = Figure(
         size = PUBLICATION_2D_FIGURE_SIZE,
         backgroundcolor = RGBf(1, 1, 1),
-        fontsize = 20,
+        fontsize = APP_FONT_SIZE,
     )
     ax = Axis(
         fig[1, 1],
@@ -934,11 +962,11 @@ function build_2d_publication_figure(
         xlabel = two_d_series.axis_x_label,
         ylabel = two_d_series.axis_y_label,
         aspect = DataAspect(),
-        titlesize = 24,
-        xlabelsize = 20,
-        ylabelsize = 20,
-        xticklabelsize = 16,
-        yticklabelsize = 16,
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
         backgroundcolor = RGBf(1, 1, 1),
         titlecolor = RGBf(0, 0, 0),
         xlabelcolor = RGBf(0, 0, 0),
@@ -964,8 +992,8 @@ function build_2d_publication_figure(
         plot;
         label = field_name,
         width = 24,
-        labelsize = 20,
-        ticklabelsize = 16,
+        labelsize = COLORBAR_LABEL_SIZE,
+        ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
         labelcolor = RGBf(0, 0, 0),
         ticklabelcolor = RGBf(0, 0, 0),
         tickcolor = RGBf(0, 0, 0),
@@ -978,6 +1006,7 @@ function build_2d_publication_figure(
     xlo, xhi = two_d_axis_limits(two_d_series.axis_x)
     ylo, yhi = two_d_axis_limits(two_d_series.axis_y)
     limits!(ax, xlo, xhi, ylo, yhi)
+    enable_adaptive_axis_ticks!(ax)
     return fig
 end
 
@@ -1110,6 +1139,36 @@ function prime_axis_title(field_name, plane::Symbol)
     else
         return "$(prime_field_label(field_name)) on XZ slice (fixed y)"
     end
+end
+
+function adaptive_tick_count(pixel_length)
+    return clamp(
+        ceil(Int, Float64(pixel_length) / AXIS_TICK_TARGET_SPACING),
+        AXIS_TICK_MIN_COUNT,
+        AXIS_TICK_MAX_COUNT,
+    )
+end
+
+function set_adaptive_ticks!(ticks, pixel_length)
+    count = adaptive_tick_count(pixel_length)
+    current_ticks = ticks[]
+    if !(current_ticks isa LinearTicks && current_ticks.n_ideal == count)
+        ticks[] = LinearTicks(count)
+    end
+end
+
+function update_adaptive_axis_ticks!(ax)
+    viewport = ax.scene.viewport[]
+    set_adaptive_ticks!(ax.xticks, width(viewport))
+    set_adaptive_ticks!(ax.yticks, height(viewport))
+end
+
+function enable_adaptive_axis_ticks!(ax)
+    on(ax.blockscene, ax.scene.viewport) do _
+        update_adaptive_axis_ticks!(ax)
+    end
+    update_adaptive_axis_ticks!(ax)
+    return ax
 end
 
 velocity_component_label(i) = VELOCITY_COMPONENT_FIELD_NAMES[i]
@@ -1823,7 +1882,7 @@ function main(;
     default_2d_snapshot_index = 1
     default_2d_snapshot = two_d_series.snapshots[default_2d_snapshot_index]
 
-    fig = Figure(size = (1500, 860), backgroundcolor = APP_BACKGROUND)
+    fig = Figure(size = APP_FIGURE_SIZE, backgroundcolor = APP_BACKGROUND, fontsize = APP_FONT_SIZE)
     colsize!(fig.layout, 1, Relative(1))
     rowsize!(fig.layout, 1, Relative(1))
 
@@ -1911,6 +1970,13 @@ function main(;
         aspect = (1, 1, 0.55),
         elevation = 0.35,
         azimuth = 5.0,
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        zlabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
+        zticklabelsize = AXIS_TICK_LABEL_SIZE,
         backgroundcolor = APP_BACKGROUND,
         titlecolor = APP_TEXT_COLOR,
         xlabelcolor = APP_TEXT_COLOR,
@@ -1963,7 +2029,7 @@ function main(;
 
     render_checklist = GridLayout(
         cloud_panel[1, 1];
-        width = Fixed(130),
+        width = Fixed(180),
         tellwidth = false,
         tellheight = false,
         halign = :right,
@@ -2012,7 +2078,7 @@ function main(;
     )
     cloud_play_button = Button(cloud_controls[1, 6], label = "Play", width = 80)
 
-    rowsize!(cloud_panel, 2, Fixed(42))
+    rowsize!(cloud_panel, 2, Fixed(CONTROL_ROW_HEIGHT))
 
     function build_slice_field_data(field_name, snapshot_index::Int)
         snapshot = snapshots[snapshot_index]
@@ -2057,6 +2123,11 @@ function main(;
         yzoomlock = true,
         xpanlock = true,
         ypanlock = true,
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
         backgroundcolor = APP_BACKGROUND,
         titlecolor = APP_TEXT_COLOR,
         xlabelcolor = APP_TEXT_COLOR,
@@ -2093,10 +2164,18 @@ function main(;
         colorrange = slice_colorrange,
         nan_color = RGBAf(0, 0, 0, 0),
     )
-    cbar = Colorbar(slice_panel[1, 2], hm, label = selected_slice_field, width = 20)
+    cbar = Colorbar(
+        slice_panel[1, 2],
+        hm,
+        label = selected_slice_field,
+        width = 24,
+        labelsize = COLORBAR_LABEL_SIZE,
+        ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
+    )
     cbar.labelcolor = APP_TEXT_COLOR
     cbar.ticklabelcolor = APP_TEXT_COLOR
     cbar.tickcolor = APP_TEXT_COLOR
+    enable_adaptive_axis_ticks!(ax_slice)
 
     prime_slice_panel = GridLayout(prime_panel[1, 1])
     colgap!(prime_slice_panel, 12)
@@ -2130,6 +2209,11 @@ function main(;
         xlabel = "x (m)",
         ylabel = "y (m)",
         aspect = DataAspect(),
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
         backgroundcolor = APP_BACKGROUND,
         titlecolor = APP_TEXT_COLOR,
         xlabelcolor = APP_TEXT_COLOR,
@@ -2150,12 +2234,20 @@ function main(;
         colorrange = prime_colorrange,
         nan_color = RGBAf(0, 0, 0, 0),
     )
-    cbar_prime = Colorbar(prime_slice_panel[1, 2], hm_prime, label = lift(selected_prime_field) do field_name
-        prime_field_label(field_name)
-    end, width = 20)
+    cbar_prime = Colorbar(
+        prime_slice_panel[1, 2],
+        hm_prime,
+        label = lift(selected_prime_field) do field_name
+            prime_field_label(field_name)
+        end,
+        width = 24,
+        labelsize = COLORBAR_LABEL_SIZE,
+        ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
+    )
     cbar_prime.labelcolor = APP_TEXT_COLOR
     cbar_prime.ticklabelcolor = APP_TEXT_COLOR
     cbar_prime.tickcolor = APP_TEXT_COLOR
+    enable_adaptive_axis_ticks!(ax_prime)
 
     selected_average_profile_field = Observable(default_average_profile_field_name)
     average_profile_direction = Observable(default_average_profile_direction)
@@ -2183,6 +2275,11 @@ function main(;
         xlabel = "x (m)",
         ylabel = "y (m)",
         aspect = DataAspect(),
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
         backgroundcolor = APP_BACKGROUND,
         titlecolor = APP_TEXT_COLOR,
         xlabelcolor = APP_TEXT_COLOR,
@@ -2209,11 +2306,14 @@ function main(;
         label = lift(selected_average_profile_field, average_profile_direction) do field_name, direction
             average_profile_label(field_name, direction)
         end,
-        width = 20,
+        width = 24,
+        labelsize = COLORBAR_LABEL_SIZE,
+        ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
     )
     cbar_average_profile.labelcolor = APP_TEXT_COLOR
     cbar_average_profile.ticklabelcolor = APP_TEXT_COLOR
     cbar_average_profile.tickcolor = APP_TEXT_COLOR
+    enable_adaptive_axis_ticks!(ax_average_profile)
     average_profile_note = Label(
         average_profile_panel[2, 1:2],
         "",
@@ -2241,6 +2341,11 @@ function main(;
         xlabel = two_d_series.axis_x_label,
         ylabel = two_d_series.axis_y_label,
         aspect = DataAspect(),
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
         backgroundcolor = APP_BACKGROUND,
         titlecolor = APP_TEXT_COLOR,
         xlabelcolor = APP_TEXT_COLOR,
@@ -2265,7 +2370,9 @@ function main(;
         two_d_panel[1, 2],
         mesh_2d,
         label = selected_2d_field,
-        width = 20,
+        width = 24,
+        labelsize = COLORBAR_LABEL_SIZE,
+        ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
     )
     cbar_2d.labelcolor = APP_TEXT_COLOR
     cbar_2d.ticklabelcolor = APP_TEXT_COLOR
@@ -2273,6 +2380,7 @@ function main(;
     two_d_xlo, two_d_xhi = two_d_axis_limits(two_d_series.axis_x)
     two_d_ylo, two_d_yhi = two_d_axis_limits(two_d_series.axis_y)
     limits!(ax_2d, two_d_xlo, two_d_xhi, two_d_ylo, two_d_yhi)
+    enable_adaptive_axis_ticks!(ax_2d)
     two_d_note = Label(
         two_d_panel[2, 1:2],
         "",
@@ -2298,11 +2406,11 @@ function main(;
             title = title,
             xlabel = i == 3 ? velocity_stress_profile_label(i, j) : "",
             ylabel = j == 1 ? "z (m)" : "",
-            titlesize = 12,
-            xlabelsize = 10,
-            ylabelsize = 10,
-            xticklabelsize = 9,
-            yticklabelsize = 9,
+            titlesize = 16,
+            xlabelsize = 14,
+            ylabelsize = 14,
+            xticklabelsize = 12,
+            yticklabelsize = 12,
             backgroundcolor = APP_BACKGROUND,
             titlecolor = APP_TEXT_COLOR,
             xlabelcolor = APP_TEXT_COLOR,
@@ -2332,14 +2440,14 @@ function main(;
     rowsize!(velocity_stress_panel, 4, Fixed(0))
 
     export_status_text = Observable("")
-    exports_title = Label(exports_panel[1, 1], "NetCDF export", color = APP_TEXT_COLOR, fontsize = 24, visible = false)
+    exports_title = Label(exports_panel[1, 1], "NetCDF export", color = APP_TEXT_COLOR, fontsize = AXIS_TITLE_SIZE, visible = false)
     exports_status = Label(exports_panel[2, 1], export_status_text, color = APP_TEXT_COLOR, tellwidth = false)
     rowsize!(exports_panel, 1, Fixed(0))
     rowsize!(exports_panel, 2, Fixed(32))
 
     slice_controls = GridLayout(root_layout[3, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
     colgap!(slice_controls, 10)
-    rowgap!(slice_controls, 8)
+    rowgap!(slice_controls, CONTROL_ROW_GAP)
     colsize!(slice_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
 
     slice_field_caption = Label(slice_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
@@ -2400,10 +2508,10 @@ function main(;
 
     prime_controls = GridLayout(root_layout[4, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
     colgap!(prime_controls, 10)
-    rowgap!(prime_controls, 8)
+    rowgap!(prime_controls, CONTROL_ROW_GAP)
     colsize!(prime_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
 
-    rowsize!(root_layout, 1, Fixed(44))
+    rowsize!(root_layout, 1, Fixed(TOOLBAR_HEIGHT))
     rowsize!(root_layout, 2, Auto(false, 1))
     rowsize!(root_layout, 3, Fixed(0))
     rowsize!(root_layout, 4, Fixed(0))
@@ -2470,7 +2578,7 @@ function main(;
 
     average_profile_controls = GridLayout(root_layout[5, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
     colgap!(average_profile_controls, 10)
-    rowgap!(average_profile_controls, 8)
+    rowgap!(average_profile_controls, CONTROL_ROW_GAP)
     colsize!(average_profile_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
 
     average_profile_field_caption = Label(average_profile_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
@@ -2481,18 +2589,18 @@ function main(;
         width = 360,
         direction = :down,
     )
-    average_profile_direction_caption = Label(average_profile_controls[2, 1], "Average over:", color = APP_TEXT_COLOR, halign = :right)
+    average_profile_direction_caption = Label(average_profile_controls[2, 1], "Mean plane:", color = APP_TEXT_COLOR, halign = :right)
     average_profile_direction_buttons = GridLayout(average_profile_controls[2, 2]; tellwidth = false, halign = :left)
     colgap!(average_profile_direction_buttons, 10)
-    btn_average_x = Button(average_profile_direction_buttons[1, 1], label = "X -> YZ")
-    btn_average_y = Button(average_profile_direction_buttons[1, 2], label = "Y -> XZ")
-    btn_average_z = Button(average_profile_direction_buttons[1, 3], label = "Z -> XY")
+    btn_average_z = Button(average_profile_direction_buttons[1, 1], label = "XY (avg z)")
+    btn_average_x = Button(average_profile_direction_buttons[1, 2], label = "YZ (avg x)")
+    btn_average_y = Button(average_profile_direction_buttons[1, 3], label = "XZ (avg y)")
     average_profile_info = Label(average_profile_controls[3, 2], "", color = APP_TEXT_COLOR, visible = false)
     rowsize!(root_layout, 5, Fixed(0))
 
     two_d_controls = GridLayout(root_layout[6, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
     colgap!(two_d_controls, 10)
-    rowgap!(two_d_controls, 8)
+    rowgap!(two_d_controls, CONTROL_ROW_GAP)
     colsize!(two_d_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
 
     two_d_field_caption = Label(two_d_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
@@ -2574,6 +2682,7 @@ function main(;
         exports_status,
         slice_field_caption,
         slice_time_caption,
+        slice_time_text,
         plane_caption,
         z_caption,
         z_text,
@@ -3099,6 +3208,7 @@ function main(;
     end
 
     function set_slice_plane!(plane::Symbol)
+        plane_changed = slice_plane[] != plane
         slice_plane[] = plane
         is_xy = plane == :xy
         is_yz = plane == :yz
@@ -3109,8 +3219,7 @@ function main(;
         btn_xy.buttoncolor[] = themed_button_color(is_xy)
         btn_yz.buttoncolor[] = themed_button_color(is_yz)
         btn_xz.buttoncolor[] = themed_button_color(is_xz)
-
-        set_slice_controls_visibility!(current_view_mode[] == :slice)
+        plane_changed && set_slice_controls_visibility!(current_view_mode[] == :slice)
 
         if is_xy
             ax_slice.title[] = slice_axis_title(field_name, :xy)
@@ -3131,6 +3240,7 @@ function main(;
     end
 
     function set_prime_slice_plane!(plane::Symbol)
+        plane_changed = prime_slice_plane[] != plane
         prime_slice_plane[] = plane
         is_xy = plane == :xy
         is_yz = plane == :yz
@@ -3141,8 +3251,7 @@ function main(;
         btn_prime_xy.buttoncolor[] = themed_button_color(is_xy)
         btn_prime_yz.buttoncolor[] = themed_button_color(is_yz)
         btn_prime_xz.buttoncolor[] = themed_button_color(is_xz)
-
-        set_prime_controls_visibility!(current_view_mode[] == :prime)
+        plane_changed && set_prime_controls_visibility!(current_view_mode[] == :prime)
 
         if is_xy
             ax_prime.title[] = prime_axis_title(field_name, :xy)
@@ -3169,7 +3278,6 @@ function main(;
         btn_average_y.buttoncolor[] = themed_button_color(direction == :y)
         btn_average_z.buttoncolor[] = themed_button_color(direction == :z)
 
-        set_average_profile_controls_visibility!(current_view_mode[] == :average_profile)
         update_average_profile_display!()
     end
 
@@ -3235,28 +3343,28 @@ function main(;
             rowsize!(root_layout, 5, Fixed(0))
             rowsize!(root_layout, 6, Fixed(0))
         elseif show_slice
-            rowsize!(root_layout, 3, Fixed(CONTROL_PANEL_HEIGHT))
+            rowsize!(root_layout, 3, Fixed(SLICE_CONTROL_PANEL_HEIGHT))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
             rowsize!(root_layout, 6, Fixed(0))
             set_slice_plane!(slice_plane[])
         elseif show_prime
             rowsize!(root_layout, 3, Fixed(0))
-            rowsize!(root_layout, 4, Fixed(CONTROL_PANEL_HEIGHT))
+            rowsize!(root_layout, 4, Fixed(PRIME_CONTROL_PANEL_HEIGHT))
             rowsize!(root_layout, 5, Fixed(0))
             rowsize!(root_layout, 6, Fixed(0))
             set_prime_slice_plane!(prime_slice_plane[])
         elseif show_average_profile
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
-            rowsize!(root_layout, 5, Fixed(CONTROL_PANEL_HEIGHT))
+            rowsize!(root_layout, 5, Fixed(AVERAGE_PROFILE_CONTROL_PANEL_HEIGHT))
             rowsize!(root_layout, 6, Fixed(0))
             set_average_profile_direction!(average_profile_direction[])
         elseif show_2d_data
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
-            rowsize!(root_layout, 6, Fixed(CONTROL_PANEL_HEIGHT))
+            rowsize!(root_layout, 6, Fixed(TWO_D_CONTROL_PANEL_HEIGHT))
             update_2d_plot_display!()
         else
             rowsize!(root_layout, 3, Fixed(0))
