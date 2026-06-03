@@ -21,6 +21,8 @@ const DATA_DIR = @__DIR__
 const DEFAULT_DATA_PATH = joinpath(DATA_DIR, "simulation.pvd")
 const DEFAULT_2D_DATA_DIR = joinpath(DATA_DIR, "2d")
 const DEFAULT_NETCDF_EXPORT_PATH = joinpath(DATA_DIR, "simulation.nc")
+const DEFAULT_2D_NETCDF_EXPORT_PATH = joinpath(DATA_DIR, "2d_data.nc")
+const DEFAULT_3D_PNG_EXPORT_DIR = joinpath(DATA_DIR, "3d_png")
 const DEFAULT_2D_PNG_EXPORT_DIR = joinpath(DATA_DIR, "2d_png")
 const DEFAULT_FIELD_ORDER = ["ρ", "u", "v", "w", "p", "T", "θ", "θp"]
 const VELOCITY_COMPONENT_FIELD_NAMES = ["u", "v", "w"]
@@ -34,7 +36,7 @@ const RENDER_PLAYBACK_SPEED_OPTIONS = ["1x", "2x", "4x"]
 const RENDER_PLAYBACK_INTERVAL_SECONDS = Dict("1x" => 1.0, "2x" => 0.5, "4x" => 0.25)
 const NETCDF_NAME_REPLACEMENTS = Dict("ρ" => "rho", "θ" => "theta", "θp" => "thetap")
 const PUBLICATION_2D_FIGURE_SIZE = (900, 720)
-const PUBLICATION_2D_PX_PER_UNIT = 3
+const SNAPSHOT_PNG_PX_PER_UNIT = 1
 const RENDER_VARIABLE_COLORS = Dict(
     "ρ" => RGBf(0.95, 0.67, 0.16),
     "u" => RGBf(0.12, 0.47, 0.92),
@@ -75,10 +77,14 @@ const CONTROL_LABEL_WIDTH = 190
 const CONTROL_ROW_HEIGHT = 44
 const CONTROL_ROW_GAP = 8
 const CONTROL_SLIDER_WIDTH = 680
+const TWO_D_AVERAGE_ROW_HEIGHT = CONTROL_ROW_HEIGHT
+const TWO_D_AVERAGE_ROW_GAP = CONTROL_ROW_GAP
 const SLICE_CONTROL_PANEL_HEIGHT = 4 * CONTROL_ROW_HEIGHT + 6 * CONTROL_ROW_GAP
 const PRIME_CONTROL_PANEL_HEIGHT = 4 * CONTROL_ROW_HEIGHT + 7 * CONTROL_ROW_GAP
 const AVERAGE_PROFILE_CONTROL_PANEL_HEIGHT = 2 * CONTROL_ROW_HEIGHT + 2 * CONTROL_ROW_GAP
-const TWO_D_CONTROL_PANEL_HEIGHT = 4 * CONTROL_ROW_HEIGHT + 3 * CONTROL_ROW_GAP
+const TWO_D_CONTROL_PANEL_HEIGHT = 2 * CONTROL_ROW_HEIGHT + CONTROL_ROW_GAP
+const TWO_D_AVERAGE_CONTROL_PANEL_HEIGHT = 4 * TWO_D_AVERAGE_ROW_HEIGHT + 3 * TWO_D_AVERAGE_ROW_GAP
+const TWO_D_TIME_AVERAGE_CONTROL_PANEL_HEIGHT = 3 * TWO_D_AVERAGE_ROW_HEIGHT + 3 * TWO_D_AVERAGE_ROW_GAP
 const LAST_FIGURE = Ref{Any}(nothing)
 const LAST_SCREEN = Ref{Any}(nothing)
 
@@ -761,13 +767,16 @@ function netcdf_safe_name(field_name, used_names::Set{String})
     return candidate
 end
 
-function normalized_netcdf_output_path(path)
+function normalized_netcdf_output_path(path; default_path = DEFAULT_NETCDF_EXPORT_PATH)
     cleaned_path = strip(String(path))
-    isempty(cleaned_path) && (cleaned_path = DEFAULT_NETCDF_EXPORT_PATH)
+    isempty(cleaned_path) && (cleaned_path = default_path)
     output_path = isabspath(cleaned_path) ? cleaned_path : joinpath(DATA_DIR, cleaned_path)
     splitext(output_path)[2] == "" && (output_path *= ".nc")
     return normpath(output_path)
 end
+
+normalized_2d_netcdf_output_path(path) =
+    normalized_netcdf_output_path(path; default_path = DEFAULT_2D_NETCDF_EXPORT_PATH)
 
 function nc_variable_size(dim_ids, dimensions, nc_type)
     value_count = prod(Int(dimensions[dim_id + 1][2]) for dim_id in dim_ids)
@@ -899,12 +908,150 @@ function export_snapshot_series_to_netcdf(snapshot_series::SnapshotSeries, outpu
     )
 end
 
-function normalized_2d_png_output_dir(path)
+function two_d_grid_lookup(axis_x, axis_y; round_digits = ROUND_DIGITS)
+    length(axis_x) == length(axis_y) || error("2D coordinate arrays have inconsistent lengths.")
+    axis_xr = rounded_grid_coordinates(axis_x; round_digits = round_digits)
+    axis_yr = rounded_grid_coordinates(axis_y; round_digits = round_digits)
+    axis_xgrid = sort(unique(axis_xr))
+    axis_ygrid = sort(unique(axis_yr))
+    axis_x_to_idx = Dict(value => index for (index, value) in enumerate(axis_xgrid))
+    axis_y_to_idx = Dict(value => index for (index, value) in enumerate(axis_ygrid))
+    return (
+        axis_xr = axis_xr,
+        axis_yr = axis_yr,
+        axis_xgrid = axis_xgrid,
+        axis_ygrid = axis_ygrid,
+        axis_x_to_idx = axis_x_to_idx,
+        axis_y_to_idx = axis_y_to_idx,
+    )
+end
+
+function two_d_point_values_to_masked_grid(axis_x, axis_y, values; round_digits = ROUND_DIGITS)
+    length(axis_x) == length(values) || error("2D coordinates and field values have inconsistent lengths.")
+    lookup = two_d_grid_lookup(axis_x, axis_y; round_digits = round_digits)
+    value_sum = zeros(Float32, length(lookup.axis_xgrid), length(lookup.axis_ygrid))
+    sample_count = zeros(Int, size(value_sum))
+
+    @inbounds for index in eachindex(values)
+        value = Float32(values[index])
+        isfinite(value) || continue
+
+        axis_x_index = lookup.axis_x_to_idx[lookup.axis_xr[index]]
+        axis_y_index = lookup.axis_y_to_idx[lookup.axis_yr[index]]
+        value_sum[axis_x_index, axis_y_index] += value
+        sample_count[axis_x_index, axis_y_index] += 1
+    end
+
+    grid = fill(NaN32, size(value_sum))
+    valid_mask = sample_count .> 0
+    grid[valid_mask] .= value_sum[valid_mask] ./ Float32.(sample_count[valid_mask])
+    return lookup.axis_xgrid, lookup.axis_ygrid, grid, valid_mask
+end
+
+function two_d_netcdf_variable_specs(dimensions, field_names, axis_x_name, axis_y_name)
+    used_names = Set(["time", axis_x_name, axis_y_name])
+    variables = NetCDFVariableSpec[
+        NetCDFVariableSpec("time", [0], NC_DOUBLE, Any[nc_attribute("units", "simulation time")], 0, 0),
+        NetCDFVariableSpec(axis_x_name, [1], NC_DOUBLE, Any[nc_attribute("units", "m"), nc_attribute("axis", uppercase(axis_x_name))], 0, 0),
+        NetCDFVariableSpec(axis_y_name, [2], NC_DOUBLE, Any[nc_attribute("units", "m"), nc_attribute("axis", uppercase(axis_y_name))], 0, 0),
+    ]
+    field_name_map = Pair{String, String}[]
+
+    for field_name in field_names
+        nc_name = netcdf_safe_name(field_name, used_names)
+        push!(field_name_map, field_name => nc_name)
+        push!(variables, NetCDFVariableSpec(
+            nc_name,
+            [0, 2, 1],
+            NC_FLOAT,
+            Any[
+                nc_attribute("original_name", field_name),
+                nc_attribute("_FillValue", NaN32),
+            ],
+            0,
+            0,
+        ))
+    end
+
+    sized_variables = NetCDFVariableSpec[
+        NetCDFVariableSpec(
+            variable.name,
+            variable.dim_ids,
+            variable.nc_type,
+            variable.attributes,
+            nc_variable_size(variable.dim_ids, dimensions, variable.nc_type),
+            0,
+        ) for variable in variables
+    ]
+    return sized_variables, field_name_map
+end
+
+function write_two_d_netcdf_field_data(io, two_d_series::TwoDSnapshotSeries, field_name, axis_xgrid, axis_ygrid; round_digits = ROUND_DIGITS)
+    for snapshot in two_d_series.snapshots
+        axis_xgrid_i, axis_ygrid_i, grid, _ = two_d_point_values_to_masked_grid(
+            two_d_series.axis_x,
+            two_d_series.axis_y,
+            snapshot.fields[field_name];
+            round_digits = round_digits,
+        )
+        axis_xgrid_i == axis_xgrid || error("Export grid x coordinates changed while exporting $(field_name).")
+        axis_ygrid_i == axis_ygrid || error("Export grid y coordinates changed while exporting $(field_name).")
+
+        for axis_y_index in eachindex(axis_ygrid), axis_x_index in eachindex(axis_xgrid)
+            write_nc_f32(io, grid[axis_x_index, axis_y_index])
+        end
+    end
+end
+
+function export_two_d_snapshot_series_to_netcdf(two_d_series::TwoDSnapshotSeries, output_path; field_names = two_d_series.field_names, round_digits = ROUND_DIGITS)
+    isempty(two_d_series.snapshots) && error("Cannot export an empty 2D snapshot series.")
+    isempty(field_names) && error("Cannot export 2D NetCDF without point-data fields.")
+
+    lookup = two_d_grid_lookup(two_d_series.axis_x, two_d_series.axis_y; round_digits = round_digits)
+    axis_x_name = replace(two_d_series.axis_x_label, " (m)" => "")
+    axis_y_name = replace(two_d_series.axis_y_label, " (m)" => "")
+    axis_x_name == axis_y_name && error("2D NetCDF coordinate axes must have distinct names.")
+    dimensions = [
+        ("time", length(two_d_series.snapshots)),
+        (axis_x_name, length(lookup.axis_xgrid)),
+        (axis_y_name, length(lookup.axis_ygrid)),
+    ]
+    global_attributes = Any[
+        nc_attribute("source", two_d_series.source_name),
+        nc_attribute("created_by", "tool.jl"),
+        nc_attribute("conventions_note", "Scalar point data exported on regular time,$(axis_y_name),$(axis_x_name) grid."),
+    ]
+    variables, field_name_map = two_d_netcdf_variable_specs(dimensions, field_names, axis_x_name, axis_y_name)
+    variables = with_netcdf_variable_offsets(dimensions, global_attributes, variables)
+
+    final_output_path = normalized_2d_netcdf_output_path(output_path)
+    mkpath(dirname(final_output_path))
+    open(final_output_path, "w") do io
+        write_nc_header(io, dimensions, global_attributes, variables)
+        write_netcdf_coordinate_data(io, [snapshot.time for snapshot in two_d_series.snapshots])
+        write_netcdf_coordinate_data(io, lookup.axis_xgrid)
+        write_netcdf_coordinate_data(io, lookup.axis_ygrid)
+        for (field_name, _) in field_name_map
+            write_two_d_netcdf_field_data(io, two_d_series, field_name, lookup.axis_xgrid, lookup.axis_ygrid; round_digits = round_digits)
+        end
+    end
+
+    return (
+        path = final_output_path,
+        fields = field_name_map,
+        dimensions = dimensions,
+    )
+end
+
+function normalized_png_output_dir(path, default_dir)
     cleaned_path = strip(String(path))
-    isempty(cleaned_path) && (cleaned_path = DEFAULT_2D_PNG_EXPORT_DIR)
+    isempty(cleaned_path) && (cleaned_path = default_dir)
     output_dir = isabspath(cleaned_path) ? cleaned_path : joinpath(DATA_DIR, cleaned_path)
     return normpath(output_dir)
 end
+
+normalized_2d_png_output_dir(path) = normalized_png_output_dir(path, DEFAULT_2D_PNG_EXPORT_DIR)
+normalized_3d_png_output_dir(path) = normalized_png_output_dir(path, DEFAULT_3D_PNG_EXPORT_DIR)
 
 function plot_file_component(value)
     text = String(value)
@@ -926,8 +1073,156 @@ function plot_file_component(value)
     return component
 end
 
+function next_png_snapshot_path(output_dir, prefix)
+    mkpath(output_dir)
+    base_name = plot_file_component(prefix)
+    output_path = joinpath(output_dir, "$(base_name).png")
+    index = 2
+
+    while isfile(output_path)
+        output_path = joinpath(output_dir, "$(base_name)_$(index).png")
+        index += 1
+    end
+    return output_path
+end
+
+function save_plot_figure_to_png(fig, output_dir; prefix = "plot", px_per_unit = SNAPSHOT_PNG_PX_PER_UNIT)
+    final_output_dir = normpath(String(output_dir))
+    output_path = next_png_snapshot_path(final_output_dir, prefix)
+    export_screen = GLMakie.Screen(
+        visible = false,
+        start_renderloop = false,
+        px_per_unit = px_per_unit,
+    )
+    try
+        display(export_screen, fig)
+        save(output_path, Makie.colorbuffer(export_screen; figure = fig))
+    finally
+        close(export_screen)
+    end
+    return (
+        dir = final_output_dir,
+        path = output_path,
+    )
+end
+
+function slice_plane_axes(plane::Symbol, xgrid, ygrid, zgrid)
+    plane == :xy && return xgrid, ygrid, "x (m)", "y (m)"
+    plane == :yz && return ygrid, zgrid, "y (m)", "z (m)"
+    plane == :xz && return xgrid, zgrid, "x (m)", "z (m)"
+    error("Unsupported slice plane $(plane).")
+end
+
+function slice_fixed_coordinate(plane::Symbol, x_value, y_value, z_value)
+    plane == :xy && return "z", z_value
+    plane == :yz && return "x", x_value
+    plane == :xz && return "y", y_value
+    error("Unsupported slice plane $(plane).")
+end
+
+number_file_component(value; digits = 3) =
+    replace(string(round(Float64(value), digits = digits)), "-" => "minus", "." => "p")
+
+function build_heatmap_publication_figure(
+    xcoords,
+    ycoords,
+    values;
+    title,
+    xlabel,
+    ylabel,
+    colorbar_label,
+    colormap = :viridis,
+    colorrange = (-1f0, 1f0),
+)
+    fig = Figure(
+        size = PUBLICATION_2D_FIGURE_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        fontsize = APP_FONT_SIZE,
+    )
+    ax = Axis(
+        fig[1, 1],
+        title = title,
+        xlabel = xlabel,
+        ylabel = ylabel,
+        aspect = DataAspect(),
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        titlecolor = RGBf(0, 0, 0),
+        xlabelcolor = RGBf(0, 0, 0),
+        ylabelcolor = RGBf(0, 0, 0),
+        xticklabelcolor = RGBf(0, 0, 0),
+        yticklabelcolor = RGBf(0, 0, 0),
+        xtickcolor = RGBf(0, 0, 0),
+        ytickcolor = RGBf(0, 0, 0),
+        xgridcolor = RGBAf(0, 0, 0, 0.12),
+        ygridcolor = RGBAf(0, 0, 0, 0.12),
+    )
+    plot = heatmap!(
+        ax,
+        xcoords,
+        ycoords,
+        values;
+        colormap = colormap,
+        colorrange = colorrange,
+        nan_color = RGBAf(0, 0, 0, 0),
+    )
+    Colorbar(
+        fig[1, 2],
+        plot;
+        label = colorbar_label,
+        width = 24,
+        labelsize = COLORBAR_LABEL_SIZE,
+        ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
+        labelcolor = RGBf(0, 0, 0),
+        ticklabelcolor = RGBf(0, 0, 0),
+        tickcolor = RGBf(0, 0, 0),
+    )
+    limits!(ax, first(xcoords), last(xcoords), first(ycoords), last(ycoords))
+    enable_adaptive_axis_ticks!(ax)
+    return fig
+end
+
 function two_d_plot_title(field_name, snapshot::SnapshotState)
     return "$(field_name), $(snapshot.label)"
+end
+
+two_d_axis_short_name(axis_label) = replace(axis_label, " (m)" => "")
+
+function two_d_average_axis_label(two_d_series::TwoDSnapshotSeries, direction::Symbol)
+    direction == :axis_x && return two_d_series.axis_x_label
+    direction == :axis_y && return two_d_series.axis_y_label
+    error("Unsupported 2D averaging direction $(direction).")
+end
+
+function two_d_profile_axis_label(two_d_series::TwoDSnapshotSeries, direction::Symbol)
+    direction == :axis_x && return two_d_series.axis_y_label
+    direction == :axis_y && return two_d_series.axis_x_label
+    error("Unsupported 2D averaging direction $(direction).")
+end
+
+function two_d_average_direction_label(two_d_series::TwoDSnapshotSeries, direction::Symbol)
+    average_axis = two_d_axis_short_name(two_d_average_axis_label(two_d_series, direction))
+    profile_axis = two_d_axis_short_name(two_d_profile_axis_label(two_d_series, direction))
+    return "$(average_axis) avg -> $(profile_axis)"
+end
+
+function two_d_prime_title(two_d_series::TwoDSnapshotSeries, field_name, snapshot::SnapshotState, direction::Symbol)
+    average_axis = two_d_axis_short_name(two_d_average_axis_label(two_d_series, direction))
+    return "$(prime_field_label(field_name)) after $(average_axis)-average, $(snapshot.label)"
+end
+
+function two_d_time_average_profile_label(two_d_series::TwoDSnapshotSeries, field_name, direction::Symbol)
+    average_axis = two_d_axis_short_name(two_d_average_axis_label(two_d_series, direction))
+    profile_axis = two_d_axis_short_name(two_d_profile_axis_label(two_d_series, direction))
+    return "⟨$(field_name)⟩_$(average_axis)($(profile_axis))"
+end
+
+function two_d_time_average_profile_title(two_d_series::TwoDSnapshotSeries, field_name, direction::Symbol)
+    return "$(two_d_time_average_profile_label(two_d_series, field_name, direction)), time-avg"
 end
 
 function two_d_axis_limits(values)
@@ -946,6 +1241,9 @@ function build_2d_publication_figure(
     two_d_series::TwoDSnapshotSeries,
     snapshot::SnapshotState,
     field_name;
+    values = snapshot.fields[field_name],
+    title = two_d_plot_title(field_name, snapshot),
+    colorbar_label = field_name,
     colormap = :viridis,
     colorrange = (-1f0, 1f0),
 )
@@ -958,7 +1256,7 @@ function build_2d_publication_figure(
     )
     ax = Axis(
         fig[1, 1],
-        title = two_d_plot_title(field_name, snapshot),
+        title = title,
         xlabel = two_d_series.axis_x_label,
         ylabel = two_d_series.axis_y_label,
         aspect = DataAspect(),
@@ -982,7 +1280,7 @@ function build_2d_publication_figure(
         ax,
         two_d_series.points,
         two_d_series.faces;
-        color = snapshot.fields[field_name],
+        color = values,
         colormap = colormap,
         colorrange = colorrange,
         shading = NoShading,
@@ -990,7 +1288,7 @@ function build_2d_publication_figure(
     colorbar = Colorbar(
         fig[1, 2],
         plot;
-        label = field_name,
+        label = colorbar_label,
         width = 24,
         labelsize = COLORBAR_LABEL_SIZE,
         ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
@@ -1010,76 +1308,51 @@ function build_2d_publication_figure(
     return fig
 end
 
-function export_2d_plots_to_png(
+function build_2d_time_average_profile_publication_figure(
     two_d_series::TwoDSnapshotSeries,
-    output_dir;
-    field_names = two_d_series.field_names,
-    px_per_unit = PUBLICATION_2D_PX_PER_UNIT,
+    average_data,
+    field_name,
+    direction::Symbol,
 )
-    isempty(two_d_series.snapshots) && error("Cannot export PNGs from an empty 2D snapshot series.")
-    isempty(field_names) && error("Cannot export PNGs without 2D point-data fields.")
-
-    final_output_dir = normalized_2d_png_output_dir(output_dir)
-    mkpath(final_output_dir)
-    field_style_by_field = Dict(
-        field_name => global_field_colormap_and_range(two_d_series.snapshots, field_name)
-        for field_name in field_names
+    fig = Figure(
+        size = PUBLICATION_2D_FIGURE_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        fontsize = APP_FONT_SIZE,
     )
-    exported_paths = String[]
-
-    for snapshot in two_d_series.snapshots
-        snapshot_component = plot_file_component(snapshot.label)
-        for field_name in field_names
-            colormap, colorrange = field_style_by_field[field_name]
-            fig = build_2d_publication_figure(
-                two_d_series,
-                snapshot,
-                field_name;
-                colormap = colormap,
-                colorrange = colorrange,
-            )
-            filename = "$(snapshot_component)_$(plot_file_component(field_name)).png"
-            output_path = joinpath(final_output_dir, filename)
-            save(output_path, fig; px_per_unit = px_per_unit)
-            push!(exported_paths, output_path)
-        end
-    end
-
-    return (
-        dir = final_output_dir,
-        paths = exported_paths,
+    ax = Axis(
+        fig[1, 1],
+        title = two_d_time_average_profile_title(two_d_series, field_name, direction),
+        xlabel = two_d_time_average_profile_label(two_d_series, field_name, direction),
+        ylabel = two_d_profile_axis_label(two_d_series, direction),
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        titlecolor = RGBf(0, 0, 0),
+        xlabelcolor = RGBf(0, 0, 0),
+        ylabelcolor = RGBf(0, 0, 0),
+        xticklabelcolor = RGBf(0, 0, 0),
+        yticklabelcolor = RGBf(0, 0, 0),
+        xtickcolor = RGBf(0, 0, 0),
+        ytickcolor = RGBf(0, 0, 0),
+        xgridcolor = RGBAf(0, 0, 0, 0.12),
+        ygridcolor = RGBAf(0, 0, 0, 0.12),
     )
-end
-
-function export_2d_plots_to_png_subprocess(
-    output_dir;
-    data_path = DEFAULT_2D_DATA_DIR,
-    field_names = nothing,
-    px_per_unit = PUBLICATION_2D_PX_PER_UNIT,
-)
-    final_output_dir = normalized_2d_png_output_dir(output_dir)
-    tool_path = normpath(@__FILE__)
-    field_names_expr = isnothing(field_names) ? "s.field_names" : repr(collect(field_names))
-    script = """
-        include($(repr(tool_path)))
-        s = load_2d_snapshot_series($(repr(data_path)))
-        result = export_2d_plots_to_png(
-            s,
-            $(repr(final_output_dir));
-            field_names = $(field_names_expr),
-            px_per_unit = $(Int(px_per_unit)),
-        )
-        println(length(result.paths))
-    """
-
-    output = read(`$(Base.julia_cmd()) --startup-file=no -e $script`, String)
-    output_lines = [strip(line) for line in split(output, '\n') if !isempty(strip(line))]
-    isempty(output_lines) && error("2D PNG export subprocess did not report an exported file count.")
-    exported_count = parse(Int, last(output_lines))
-    return (
-        dir = final_output_dir,
-        count = exported_count,
+    lines!(
+        ax,
+        average_data.time_average_profile,
+        average_data.profile_coordinates;
+        color = RGBf(0.12, 0.42, 0.78),
+        linewidth = 4,
     )
+
+    finite_profile_values = average_data.time_average_profile[isfinite.(average_data.time_average_profile)]
+    set_profile_x_axis!(ax, finite_profile_values)
+    ylo, yhi = two_d_axis_limits(average_data.profile_coordinates)
+    ylims!(ax, ylo, yhi)
+    return fig
 end
 
 plane_name(plane::Symbol) = plane == :xy ? "XY" : plane == :yz ? "YZ" : plane == :xz ? "XZ" : error("Unsupported slice plane $(plane).")
@@ -1130,6 +1403,83 @@ end
 volume_axis_title(field_name, time) = "$(field_name) volume, $(time_label(time))"
 render_axis_title(time) = "3D volume render, $(time_label(time))"
 prime_field_label(field_name) = "$(field_name)'"
+
+function build_volume_render_publication_figure(xgrid, ygrid, zgrid, render_layers; time)
+    fig = Figure(
+        size = PUBLICATION_2D_FIGURE_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        fontsize = APP_FONT_SIZE,
+    )
+    ax = Axis3(
+        fig[1, 1],
+        title = render_axis_title(time),
+        xlabel = "x (m)",
+        ylabel = "y (m)",
+        zlabel = "z (m)",
+        aspect = (1, 1, 0.55),
+        elevation = 0.35,
+        azimuth = 5.0,
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        zlabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
+        zticklabelsize = AXIS_TICK_LABEL_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        titlecolor = RGBf(0, 0, 0),
+        xlabelcolor = RGBf(0, 0, 0),
+        ylabelcolor = RGBf(0, 0, 0),
+        zlabelcolor = RGBf(0, 0, 0),
+        xticklabelcolor = RGBf(0, 0, 0),
+        yticklabelcolor = RGBf(0, 0, 0),
+        zticklabelcolor = RGBf(0, 0, 0),
+        xtickcolor = RGBf(0, 0, 0),
+        ytickcolor = RGBf(0, 0, 0),
+        ztickcolor = RGBf(0, 0, 0),
+        xgridvisible = false,
+        ygridvisible = false,
+        zgridvisible = false,
+        xspinesvisible = false,
+        yspinesvisible = false,
+        zspinesvisible = false,
+    )
+
+    nx = length(xgrid)
+    ny = length(ygrid)
+    ground_z = fill(Float32(first(zgrid)), nx, ny)
+    ground_texture = [0.52f0 + 0.07f0 * sin(0.20f0 * i) * cos(0.18f0 * j) for i in 1:nx, j in 1:ny]
+    surface!(
+        ax,
+        xgrid,
+        ygrid,
+        ground_z;
+        color = ground_texture,
+        colormap = cgrad([RGBf(0.18, 0.43, 0.15), RGBf(0.27, 0.55, 0.26), RGBf(0.35, 0.62, 0.30)]),
+        colorrange = (0f0, 1f0),
+        shading = NoShading,
+    )
+
+    for (_, rgba) in render_layers
+        volume!(
+            ax,
+            first(xgrid)..last(xgrid),
+            first(ygrid)..last(ygrid),
+            first(zgrid)..last(zgrid),
+            rgba;
+            algorithm = :absorptionrgba,
+            absorption = 10f0,
+        )
+    end
+    limits!(ax, first(xgrid), last(xgrid), first(ygrid), last(ygrid), first(zgrid), last(zgrid))
+
+    if !isempty(render_layers)
+        field_names = first.(render_layers)
+        legend_elements = [PolyElement(color = render_variable_color(field_name)) for field_name in field_names]
+        Legend(fig[1, 2], legend_elements, field_names, "Rendered variables")
+    end
+    return fig
+end
 
 function prime_axis_title(field_name, plane::Symbol)
     if plane == :xy
@@ -1208,6 +1558,50 @@ function set_profile_x_axis!(ax, values; near_zero_threshold = 1e-6)
         pad = 0.05 * span
         xlims!(ax, lo - pad, hi + pad)
     end
+end
+
+function build_velocity_stress_publication_figure(velocity_stress_data)
+    fig = Figure(
+        size = PUBLICATION_2D_FIGURE_SIZE,
+        backgroundcolor = RGBf(1, 1, 1),
+        fontsize = APP_FONT_SIZE,
+    )
+    velocity_stress_scale = maximum(profile_maxabs(profile[.!isnan.(profile)]) for profile in velocity_stress_data.profiles)
+    near_zero_threshold = max(velocity_stress_scale * 1e-8, 1e-12)
+
+    for i in 1:3, j in 1:3
+        profile = velocity_stress_data.profiles[i, j]
+        finite_profile_values = profile[.!isnan.(profile)]
+        display_profile =
+            profile_maxabs(finite_profile_values) < near_zero_threshold ?
+            zero_profile_like(profile) :
+            profile
+        ax = Axis(
+            fig[i, j],
+            title = velocity_stress_pair_label(i, j),
+            xlabel = i == 3 ? velocity_stress_profile_label(i, j) : "",
+            ylabel = j == 1 ? "z (m)" : "",
+            titlesize = 16,
+            xlabelsize = 14,
+            ylabelsize = 14,
+            xticklabelsize = 12,
+            yticklabelsize = 12,
+            backgroundcolor = RGBf(1, 1, 1),
+            titlecolor = RGBf(0, 0, 0),
+            xlabelcolor = RGBf(0, 0, 0),
+            ylabelcolor = RGBf(0, 0, 0),
+            xticklabelcolor = RGBf(0, 0, 0),
+            yticklabelcolor = RGBf(0, 0, 0),
+            xtickcolor = RGBf(0, 0, 0),
+            ytickcolor = RGBf(0, 0, 0),
+            xgridcolor = RGBAf(0, 0, 0, 0.12),
+            ygridcolor = RGBAf(0, 0, 0, 0.12),
+        )
+        lines!(ax, display_profile, velocity_stress_data.zgrid; color = RGBf(0.10, 0.25, 0.55), linewidth = 2)
+        set_profile_x_axis!(ax, finite_profile_values; near_zero_threshold = near_zero_threshold)
+        ylims!(ax, first(velocity_stress_data.zgrid), last(velocity_stress_data.zgrid))
+    end
+    return fig
 end
 
 function masked_mean(volume, valid_mask, dims)
@@ -1670,6 +2064,86 @@ function time_average_matrices(profile_samples)
     return averaged_profile
 end
 
+function compute_two_d_spatial_prime(axis_x, axis_y, values; direction::Symbol, round_digits = ROUND_DIGITS)
+    length(axis_x) == length(axis_y) || error("2D coordinate arrays have inconsistent lengths.")
+    length(axis_x) == length(values) || error("2D coordinates and field values have inconsistent lengths.")
+
+    profile_coordinate_values =
+        direction == :axis_x ? axis_y :
+        direction == :axis_y ? axis_x :
+        error("Unsupported 2D averaging direction $(direction).")
+    rounded_profile_coordinates = rounded_grid_coordinates(profile_coordinate_values; round_digits = round_digits)
+    profile_coordinates = sort(unique(rounded_profile_coordinates))
+    coordinate_index = Dict(coordinate => idx for (idx, coordinate) in enumerate(profile_coordinates))
+    value_sum = zeros(Float32, length(profile_coordinates))
+    value_count = zeros(Int, length(profile_coordinates))
+
+    @inbounds for i in eachindex(values)
+        value = Float32(values[i])
+        isfinite(value) || continue
+        idx = coordinate_index[rounded_profile_coordinates[i]]
+        value_sum[idx] += value
+        value_count[idx] += 1
+    end
+
+    profile_values = fill(NaN32, length(profile_coordinates))
+    valid_profile_entries = value_count .> 0
+    profile_values[valid_profile_entries] .= value_sum[valid_profile_entries] ./ Float32.(value_count[valid_profile_entries])
+
+    prime_values = fill(NaN32, length(values))
+    @inbounds for i in eachindex(values)
+        value = Float32(values[i])
+        profile_value = profile_values[coordinate_index[rounded_profile_coordinates[i]]]
+        if isfinite(value) && isfinite(profile_value)
+            prime_values[i] = value - profile_value
+        end
+    end
+
+    return (
+        profile_coordinates = profile_coordinates,
+        profile_values = profile_values,
+        prime_values = prime_values,
+    )
+end
+
+function compute_two_d_average_data(two_d_series::TwoDSnapshotSeries, field_name; direction::Symbol, round_digits = ROUND_DIGITS)
+    isempty(two_d_series.snapshots) && error("2D snapshot series contains no snapshots.")
+    require_fields(two_d_series.base_snapshot.fields, [field_name])
+
+    spatial_data = [
+        compute_two_d_spatial_prime(
+            two_d_series.axis_x,
+            two_d_series.axis_y,
+            snapshot.fields[field_name];
+            direction = direction,
+            round_digits = round_digits,
+        )
+        for snapshot in two_d_series.snapshots
+    ]
+    profile_coordinates = first(spatial_data).profile_coordinates
+    for data in spatial_data
+        data.profile_coordinates == profile_coordinates || error("Cannot time-average 2D profiles with inconsistent coordinates.")
+    end
+
+    prime_values_by_snapshot = [data.prime_values for data in spatial_data]
+    finite_prime_values = reduce(
+        vcat,
+        (values[isfinite.(values)] for values in prime_values_by_snapshot);
+        init = Float32[],
+    )
+
+    return (
+        direction = direction,
+        profile_coordinates = profile_coordinates,
+        time_average_profile = time_average_matrices([data.profile_values for data in spatial_data]),
+        prime_values_by_snapshot = prime_values_by_snapshot,
+        prime_colorrange = symmetric_colorrange(finite_prime_values),
+        snapshot_count = length(two_d_series.snapshots),
+        series_mode = two_d_series.mode,
+        series_source = two_d_series.source_name,
+    )
+end
+
 function compute_average_profiles_by_direction(snapshot_series::SnapshotSeries, field_name; directions = (:x, :y, :z), round_digits = ROUND_DIGITS)
     isempty(snapshot_series.snapshots) && error("Snapshot series contains no snapshots.")
     require_fields(snapshot_series.base_snapshot.fields, [field_name])
@@ -1881,6 +2355,16 @@ function main(;
     default_2d_field_name = first(two_d_series.field_names)
     default_2d_snapshot_index = 1
     default_2d_snapshot = two_d_series.snapshots[default_2d_snapshot_index]
+    two_d_average_data_cache = Dict{Tuple{String, Symbol}, Any}()
+
+    function get_two_d_average_data(field_name, direction::Symbol)
+        return get!(two_d_average_data_cache, (field_name, direction)) do
+            compute_two_d_average_data(two_d_series, field_name; direction = direction, round_digits = ROUND_DIGITS)
+        end
+    end
+
+    default_2d_average_direction = :axis_x
+    default_2d_average_data = get_two_d_average_data(default_2d_field_name, default_2d_average_direction)
 
     fig = Figure(size = APP_FIGURE_SIZE, backgroundcolor = APP_BACKGROUND, fontsize = APP_FONT_SIZE)
     colsize!(fig.layout, 1, Relative(1))
@@ -1898,8 +2382,10 @@ function main(;
     btn_velocity_stress = Button(toolbar[1, 5], label = "u'v'w'")
     btn_exports = Button(toolbar[1, 6], label = "Exports")
     btn_2d_data = Button(toolbar[1, 7], label = "2D Data")
-    dark_mode_caption = Label(toolbar[1, 8], "Dark mode:", color = APP_TEXT_COLOR)
-    dark_mode_checkbox = Checkbox(toolbar[1, 9]; checked = false)
+    btn_2d_average = Button(toolbar[1, 8], label = "2D Averages")
+    btn_2d_exports = Button(toolbar[1, 9], label = "2D Exports")
+    dark_mode_caption = Label(toolbar[1, 10], "Dark mode:", color = APP_TEXT_COLOR)
+    dark_mode_checkbox = Checkbox(toolbar[1, 11]; checked = false)
     colgap!(toolbar, 10)
 
     main_layout = GridLayout(
@@ -1920,6 +2406,16 @@ function main(;
     prime_panel = GridLayout(main_layout[1, 1])
     average_profile_panel = GridLayout(main_layout[1, 1])
     two_d_panel = GridLayout(main_layout[1, 1])
+    two_d_average_panel = GridLayout(main_layout[1, 1])
+    two_d_exports_panel = GridLayout(
+        main_layout[1, 1];
+        width = Relative(1),
+        height = Relative(1),
+        tellwidth = false,
+        tellheight = false,
+        valign = :top,
+        alignmode = Outside(),
+    )
     exports_panel = GridLayout(
         main_layout[1, 1];
         width = Relative(1),
@@ -1941,16 +2437,22 @@ function main(;
     colgap!(slice_panel, 12)
     colgap!(average_profile_panel, 12)
     colgap!(two_d_panel, 12)
+    colgap!(two_d_average_panel, 12)
+    colgap!(two_d_exports_panel, 12)
     colgap!(exports_panel, 12)
     colgap!(velocity_stress_panel, 8)
     rowgap!(cloud_panel, 10)
     rowgap!(average_profile_panel, 6)
     rowgap!(two_d_panel, 6)
+    rowgap!(two_d_average_panel, 6)
+    rowgap!(two_d_exports_panel, 10)
     rowgap!(exports_panel, 10)
     rowgap!(velocity_stress_panel, 6)
     colsize!(slice_panel, 1, Relative(1))
     colsize!(average_profile_panel, 1, Relative(1))
     colsize!(two_d_panel, 1, Relative(1))
+    colsize!(two_d_average_panel, 1, Relative(1))
+    colsize!(two_d_exports_panel, 1, Relative(1))
     colsize!(exports_panel, 1, Relative(1))
     colsize!(cloud_panel, 1, Relative(1))
 
@@ -2389,6 +2891,111 @@ function main(;
     )
     rowsize!(two_d_panel, 2, Fixed(0))
 
+    selected_2d_average_field = Observable(default_2d_field_name)
+    two_d_average_snapshot_index = Observable(default_2d_snapshot_index)
+    two_d_average_direction = Observable(default_2d_average_direction)
+    two_d_average_mode = Observable(:prime)
+    selected_2d_average_data = Observable(default_2d_average_data)
+    two_d_average_prime_values = lift(selected_2d_average_data, two_d_average_snapshot_index) do average_data, snapshot_index
+        average_data.prime_values_by_snapshot[snapshot_index]
+    end
+    two_d_average_prime_colorrange = lift(selected_2d_average_data) do average_data
+        average_data.prime_colorrange
+    end
+    two_d_average_profile_coordinates = lift(selected_2d_average_data) do average_data
+        average_data.profile_coordinates
+    end
+    two_d_time_average_profile = lift(selected_2d_average_data) do average_data
+        average_data.time_average_profile
+    end
+
+    ax_2d_average_prime = Axis(
+        two_d_average_panel[1, 1],
+        title = two_d_prime_title(two_d_series, default_2d_field_name, default_2d_snapshot, default_2d_average_direction),
+        xlabel = two_d_series.axis_x_label,
+        ylabel = two_d_series.axis_y_label,
+        aspect = DataAspect(),
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
+        backgroundcolor = APP_BACKGROUND,
+        titlecolor = APP_TEXT_COLOR,
+        xlabelcolor = APP_TEXT_COLOR,
+        ylabelcolor = APP_TEXT_COLOR,
+        xticklabelcolor = APP_TEXT_COLOR,
+        yticklabelcolor = APP_TEXT_COLOR,
+        xtickcolor = APP_TEXT_COLOR,
+        ytickcolor = APP_TEXT_COLOR,
+        xgridcolor = APP_GRID_COLOR,
+        ygridcolor = APP_GRID_COLOR,
+    )
+    mesh_2d_average_prime = mesh!(
+        ax_2d_average_prime,
+        two_d_series.points,
+        two_d_series.faces;
+        color = two_d_average_prime_values,
+        colormap = :balance,
+        colorrange = two_d_average_prime_colorrange,
+        shading = NoShading,
+    )
+    cbar_2d_average_prime = Colorbar(
+        two_d_average_panel[1, 2],
+        mesh_2d_average_prime,
+        label = lift(selected_2d_average_field) do field_name
+            prime_field_label(field_name)
+        end,
+        width = 24,
+        labelsize = COLORBAR_LABEL_SIZE,
+        ticklabelsize = COLORBAR_TICK_LABEL_SIZE,
+    )
+    cbar_2d_average_prime.labelcolor = APP_TEXT_COLOR
+    cbar_2d_average_prime.ticklabelcolor = APP_TEXT_COLOR
+    cbar_2d_average_prime.tickcolor = APP_TEXT_COLOR
+    limits!(ax_2d_average_prime, two_d_xlo, two_d_xhi, two_d_ylo, two_d_yhi)
+    enable_adaptive_axis_ticks!(ax_2d_average_prime)
+
+    ax_2d_average_profile = Axis(
+        two_d_average_panel[1, 1],
+        title = two_d_time_average_profile_title(two_d_series, default_2d_field_name, default_2d_average_direction),
+        xlabel = two_d_time_average_profile_label(two_d_series, default_2d_field_name, default_2d_average_direction),
+        ylabel = two_d_profile_axis_label(two_d_series, default_2d_average_direction),
+        titlesize = AXIS_TITLE_SIZE,
+        xlabelsize = AXIS_LABEL_SIZE,
+        ylabelsize = AXIS_LABEL_SIZE,
+        xticklabelsize = AXIS_TICK_LABEL_SIZE,
+        yticklabelsize = AXIS_TICK_LABEL_SIZE,
+        backgroundcolor = APP_BACKGROUND,
+        titlecolor = APP_TEXT_COLOR,
+        xlabelcolor = APP_TEXT_COLOR,
+        ylabelcolor = APP_TEXT_COLOR,
+        xticklabelcolor = APP_TEXT_COLOR,
+        yticklabelcolor = APP_TEXT_COLOR,
+        xtickcolor = APP_TEXT_COLOR,
+        ytickcolor = APP_TEXT_COLOR,
+        xgridcolor = APP_GRID_COLOR,
+        ygridcolor = APP_GRID_COLOR,
+    )
+    line_2d_average_profile = lines!(
+        ax_2d_average_profile,
+        two_d_time_average_profile,
+        two_d_average_profile_coordinates;
+        color = RGBf(0.12, 0.42, 0.78),
+        linewidth = 4,
+    )
+    default_2d_average_profile = default_2d_average_data.time_average_profile
+    set_profile_x_axis!(ax_2d_average_profile, default_2d_average_profile[isfinite.(default_2d_average_profile)])
+    two_d_average_profile_ylo, two_d_average_profile_yhi = two_d_axis_limits(default_2d_average_data.profile_coordinates)
+    ylims!(ax_2d_average_profile, two_d_average_profile_ylo, two_d_average_profile_yhi)
+    two_d_average_note = Label(
+        two_d_average_panel[2, 1:2],
+        "",
+        color = APP_TEXT_COLOR,
+        visible = false,
+    )
+    rowsize!(two_d_average_panel, 2, Fixed(0))
+
     velocity_stress_axes = Matrix{Any}(undef, 3, 3)
     velocity_stress_lines = Matrix{Any}(undef, 3, 3)
     velocity_stress_scale = maximum(profile_maxabs(profile[.!isnan.(profile)]) for profile in velocity_stress_data.profiles)
@@ -2624,19 +3231,78 @@ function main(;
     two_d_time_text = Label(two_d_time_row[1, 2], lift(two_d_snapshot_index) do idx
         two_d_series.snapshots[idx].label
     end, color = APP_TEXT_COLOR)
-    two_d_export_path_caption = Label(two_d_controls[3, 1], "PNG folder:", color = APP_TEXT_COLOR, halign = :right)
-    two_d_export_row = GridLayout(two_d_controls[3, 2]; tellwidth = false, halign = :left)
-    colgap!(two_d_export_row, 10)
-    two_d_export_path_textbox = Textbox(
-        two_d_export_row[1, 1],
-        stored_string = DEFAULT_2D_PNG_EXPORT_DIR,
-        width = CONTROL_SLIDER_WIDTH,
-    )
-    two_d_export_button = Button(two_d_export_row[1, 2], label = "Export PNGs", width = 140)
-    two_d_export_status_text = Observable("")
-    two_d_export_status = Label(two_d_controls[4, 2], two_d_export_status_text, color = APP_TEXT_COLOR, visible = false)
-    two_d_export_running = Observable(false)
     rowsize!(root_layout, 6, Fixed(0))
+
+    two_d_average_controls = GridLayout(root_layout[7, 1]; width = Relative(1), tellwidth = false, halign = :left, valign = :top)
+    colgap!(two_d_average_controls, 10)
+    colsize!(two_d_average_controls, 1, Fixed(CONTROL_LABEL_WIDTH))
+
+    two_d_average_field_caption = Label(two_d_average_controls[1, 1], "Variable:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_average_field_menu = Menu(
+        two_d_average_controls[1, 2],
+        options = two_d_series.field_names,
+        default = default_2d_field_name,
+        width = 360,
+        direction = :down,
+    )
+    two_d_average_mode_caption = Label(two_d_average_controls[2, 1], "Quantity:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_average_mode_buttons = GridLayout(two_d_average_controls[2, 2]; tellwidth = false, halign = :left)
+    colgap!(two_d_average_mode_buttons, 10)
+    btn_2d_average_prime = Button(two_d_average_mode_buttons[1, 1], label = "Prime field")
+    btn_2d_average_time_mean = Button(two_d_average_mode_buttons[1, 2], label = "Time-avg mean")
+    two_d_average_direction_caption = Label(two_d_average_controls[3, 1], "Average over:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_average_direction_buttons = GridLayout(two_d_average_controls[3, 2]; tellwidth = false, halign = :left)
+    colgap!(two_d_average_direction_buttons, 10)
+    btn_2d_average_axis_x = Button(
+        two_d_average_direction_buttons[1, 1],
+        label = two_d_average_direction_label(two_d_series, :axis_x),
+    )
+    btn_2d_average_axis_y = Button(
+        two_d_average_direction_buttons[1, 2],
+        label = two_d_average_direction_label(two_d_series, :axis_y),
+    )
+    two_d_average_time_caption = Label(two_d_average_controls[4, 1], "2D file:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_average_time_row = GridLayout(two_d_average_controls[4, 2]; tellwidth = false, halign = :left)
+    colgap!(two_d_average_time_row, 10)
+    two_d_average_time_slider = Slider(
+        two_d_average_time_row[1, 1],
+        range = 0:(length(two_d_series.snapshots) - 1),
+        startvalue = 0,
+        width = CONTROL_SLIDER_WIDTH,
+        snap = true,
+    )
+    two_d_average_time_text = Label(two_d_average_time_row[1, 2], lift(two_d_average_snapshot_index) do idx
+        two_d_series.snapshots[idx].label
+    end, color = APP_TEXT_COLOR)
+    rowgap!(two_d_average_controls, TWO_D_AVERAGE_ROW_GAP)
+    rowsize!(root_layout, 7, Fixed(0))
+
+    two_d_export_status_text = Observable("")
+    two_d_exports_title = Label(two_d_exports_panel[1, 1], "2D export", color = APP_TEXT_COLOR, fontsize = AXIS_TITLE_SIZE, visible = false)
+    two_d_export_status = Label(two_d_exports_panel[2, 1], two_d_export_status_text, color = APP_TEXT_COLOR, tellwidth = false)
+    rowsize!(two_d_exports_panel, 1, Fixed(0))
+    rowsize!(two_d_exports_panel, 2, Fixed(32))
+
+    two_d_export_controls = GridLayout(two_d_exports_panel[3, 1])
+    colgap!(two_d_export_controls, 10)
+    rowgap!(two_d_export_controls, 8)
+    two_d_netcdf_export_path_caption = Label(two_d_export_controls[1, 1], "NetCDF path:", color = APP_TEXT_COLOR)
+    two_d_netcdf_export_path_textbox = Textbox(
+        two_d_export_controls[1, 2:4],
+        stored_string = DEFAULT_2D_NETCDF_EXPORT_PATH,
+        width = 760,
+    )
+    two_d_netcdf_export_button = Button(two_d_export_controls[1, 5], label = "Export to NetCDF", width = 160)
+    two_d_export_path_caption = Label(two_d_export_controls[2, 1], "PNG folder:", color = APP_TEXT_COLOR)
+    two_d_export_path_textbox = Textbox(
+        two_d_export_controls[2, 2:4],
+        stored_string = DEFAULT_2D_PNG_EXPORT_DIR,
+        width = 760,
+    )
+    two_d_export_button = Button(two_d_export_controls[2, 5], label = "Export PNGs", width = 160)
+    two_d_netcdf_export_running = Observable(false)
+    two_d_export_running = Observable(false)
+    rowsize!(two_d_exports_panel, 3, Fixed(96))
 
     export_controls = GridLayout(exports_panel[3, 1])
     colgap!(export_controls, 10)
@@ -2648,10 +3314,18 @@ function main(;
         width = 760,
     )
     export_button = Button(export_controls[1, 5], label = "Export to NetCDF", width = 160)
+    png_export_path_caption = Label(export_controls[2, 1], "PNG folder:", color = APP_TEXT_COLOR)
+    png_export_path_textbox = Textbox(
+        export_controls[2, 2:4],
+        stored_string = DEFAULT_3D_PNG_EXPORT_DIR,
+        width = 760,
+    )
+    png_export_button = Button(export_controls[2, 5], label = "Export PNGs", width = 160)
     export_running = Observable(false)
-    rowsize!(exports_panel, 3, Fixed(48))
+    png_export_running = Observable(false)
+    rowsize!(exports_panel, 3, Fixed(96))
 
-    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu)
+    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu, two_d_average_field_menu)
 
     function close_menu!(menu)
         menu.is_open[] = false
@@ -2710,18 +3384,29 @@ function main(;
         two_d_field_caption,
         two_d_time_caption,
         two_d_time_text,
+        two_d_exports_title,
+        two_d_netcdf_export_path_caption,
         two_d_export_path_caption,
         two_d_export_status,
+        two_d_average_note,
+        two_d_average_field_caption,
+        two_d_average_mode_caption,
+        two_d_average_direction_caption,
+        two_d_average_time_caption,
+        two_d_average_time_text,
         export_path_caption,
+        png_export_path_caption,
     ]
-    app_axes_2d = Any[ax_slice, ax_prime, ax_average_profile, ax_2d, collect(velocity_stress_axes)...]
-    app_colorbars = Any[cbar, cbar_prime, cbar_average_profile, cbar_2d]
+    app_axes_2d = Any[ax_slice, ax_prime, ax_average_profile, ax_2d, ax_2d_average_prime, ax_2d_average_profile, collect(velocity_stress_axes)...]
+    app_colorbars = Any[cbar, cbar_prime, cbar_average_profile, cbar_2d, cbar_2d_average_prime]
     app_buttons = Any[
         btn_cloud,
         btn_slice,
         btn_prime,
         btn_average_profile,
         btn_2d_data,
+        btn_2d_average,
+        btn_2d_exports,
         btn_velocity_stress,
         btn_exports,
         cloud_play_button,
@@ -2734,11 +3419,17 @@ function main(;
         btn_average_x,
         btn_average_y,
         btn_average_z,
+        btn_2d_average_prime,
+        btn_2d_average_time_mean,
+        btn_2d_average_axis_x,
+        btn_2d_average_axis_y,
+        two_d_netcdf_export_button,
         two_d_export_button,
         export_button,
+        png_export_button,
     ]
-    app_menus = Any[cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu]
-    app_textboxes = Any[export_path_textbox, two_d_export_path_textbox]
+    app_menus = Any[cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu, two_d_average_field_menu]
+    app_textboxes = Any[export_path_textbox, png_export_path_textbox, two_d_netcdf_export_path_textbox, two_d_export_path_textbox]
     app_checkboxes = Any[dark_mode_checkbox, values(render_checkbox_by_field)...]
 
     function current_theme()
@@ -3147,16 +3838,50 @@ function main(;
         two_d_time_caption.visible[] = show_controls
         two_d_time_slider.blockscene.visible[] = show_controls
         two_d_time_text.visible[] = show_controls
-        two_d_export_path_caption.visible[] = show_controls
-        two_d_export_path_textbox.blockscene.visible[] = show_controls
-        two_d_export_button.blockscene.visible[] = show_controls
-        two_d_export_status.visible[] = show_controls
         two_d_note.visible[] = false
 
         rowsize!(two_d_controls, 1, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
         rowsize!(two_d_controls, 2, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
-        rowsize!(two_d_controls, 3, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
-        rowsize!(two_d_controls, 4, show_controls ? Fixed(CONTROL_ROW_HEIGHT) : Fixed(0))
+    end
+
+    function set_2d_average_controls_visibility!(show_controls::Bool)
+        show_controls || close_menu!(two_d_average_field_menu)
+        show_file = show_controls && two_d_average_mode[] == :prime
+
+        two_d_average_field_caption.visible[] = show_controls
+        two_d_average_field_menu.blockscene.visible[] = show_controls
+        two_d_average_mode_caption.visible[] = show_controls
+        btn_2d_average_prime.blockscene.visible[] = show_controls
+        btn_2d_average_time_mean.blockscene.visible[] = show_controls
+        two_d_average_direction_caption.visible[] = show_controls
+        btn_2d_average_axis_x.blockscene.visible[] = show_controls
+        btn_2d_average_axis_y.blockscene.visible[] = show_controls
+        two_d_average_time_caption.visible[] = show_file
+        two_d_average_time_slider.blockscene.visible[] = show_file
+        two_d_average_time_text.visible[] = show_file
+        two_d_average_note.visible[] = false
+
+        rowsize!(two_d_average_controls, 1, show_controls ? Fixed(TWO_D_AVERAGE_ROW_HEIGHT) : Fixed(0))
+        rowsize!(two_d_average_controls, 2, show_controls ? Fixed(TWO_D_AVERAGE_ROW_HEIGHT) : Fixed(0))
+        rowsize!(two_d_average_controls, 3, show_controls ? Fixed(TWO_D_AVERAGE_ROW_HEIGHT) : Fixed(0))
+        rowsize!(two_d_average_controls, 4, show_file ? Fixed(TWO_D_AVERAGE_ROW_HEIGHT) : Fixed(0))
+    end
+
+    function set_2d_export_controls_visibility!(show_controls::Bool)
+        two_d_exports_title.visible[] = false
+        two_d_export_status.visible[] = show_controls
+        two_d_netcdf_export_path_caption.visible[] = show_controls
+        two_d_netcdf_export_path_textbox.blockscene.visible[] = show_controls
+        two_d_netcdf_export_button.blockscene.visible[] = show_controls
+        two_d_export_path_caption.visible[] = show_controls
+        two_d_export_path_textbox.blockscene.visible[] = show_controls
+        two_d_export_button.blockscene.visible[] = show_controls
+
+        rowsize!(two_d_exports_panel, 1, Fixed(0))
+        rowsize!(two_d_exports_panel, 2, show_controls ? Fixed(32) : Fixed(0))
+        rowsize!(two_d_exports_panel, 3, show_controls ? Fixed(96) : Fixed(0))
+        rowsize!(two_d_export_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(two_d_export_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
     end
 
     function set_export_controls_visibility!(show_controls::Bool)
@@ -3165,11 +3890,15 @@ function main(;
         export_path_caption.visible[] = show_controls
         export_path_textbox.blockscene.visible[] = show_controls
         export_button.blockscene.visible[] = show_controls
+        png_export_path_caption.visible[] = show_controls
+        png_export_path_textbox.blockscene.visible[] = show_controls
+        png_export_button.blockscene.visible[] = show_controls
 
         rowsize!(exports_panel, 1, Fixed(0))
         rowsize!(exports_panel, 2, show_controls ? Fixed(32) : Fixed(0))
-        rowsize!(exports_panel, 3, show_controls ? Fixed(48) : Fixed(0))
+        rowsize!(exports_panel, 3, show_controls ? Fixed(96) : Fixed(0))
         rowsize!(export_controls, 1, show_controls ? Auto(0.12) : Fixed(0))
+        rowsize!(export_controls, 2, show_controls ? Auto(0.12) : Fixed(0))
     end
 
     function update_average_profile_display!()
@@ -3205,6 +3934,66 @@ function main(;
     function set_2d_field!(field_name)
         selected_2d_field[] = field_name
         update_2d_plot_display!()
+    end
+
+    function update_2d_average_plot_visibility!()
+        show_tab = current_view_mode[] == :two_d_average
+        show_prime = show_tab && two_d_average_mode[] == :prime
+        show_time_mean = show_tab && two_d_average_mode[] == :time_mean
+
+        ax_2d_average_prime.scene.visible[] = show_prime
+        ax_2d_average_prime.blockscene.visible[] = show_prime
+        mesh_2d_average_prime.visible[] = show_prime
+        cbar_2d_average_prime.blockscene.visible[] = show_prime
+        ax_2d_average_profile.scene.visible[] = show_time_mean
+        ax_2d_average_profile.blockscene.visible[] = show_time_mean
+        line_2d_average_profile.visible[] = show_time_mean
+        two_d_average_note.visible[] = false
+    end
+
+    function update_2d_average_display!()
+        field_name = selected_2d_average_field[]
+        direction = two_d_average_direction[]
+        average_data = get_two_d_average_data(field_name, direction)
+        snapshot = two_d_series.snapshots[two_d_average_snapshot_index[]]
+
+        selected_2d_average_data[] = average_data
+        ax_2d_average_prime.title[] = two_d_prime_title(two_d_series, field_name, snapshot, direction)
+        ax_2d_average_profile.title[] = two_d_time_average_profile_title(two_d_series, field_name, direction)
+        ax_2d_average_profile.xlabel[] = two_d_time_average_profile_label(two_d_series, field_name, direction)
+        ax_2d_average_profile.ylabel[] = two_d_profile_axis_label(two_d_series, direction)
+
+        finite_profile_values = average_data.time_average_profile[isfinite.(average_data.time_average_profile)]
+        ax_2d_average_profile.xticks[] = LinearTicks(5)
+        set_profile_x_axis!(ax_2d_average_profile, finite_profile_values)
+        profile_ylo, profile_yhi = two_d_axis_limits(average_data.profile_coordinates)
+        ylims!(ax_2d_average_profile, profile_ylo, profile_yhi)
+        update_2d_average_plot_visibility!()
+    end
+
+    function set_2d_average_field!(field_name)
+        selected_2d_average_field[] = field_name
+        update_2d_average_display!()
+    end
+
+    function set_2d_average_direction!(direction::Symbol)
+        two_d_average_direction[] = direction
+        btn_2d_average_axis_x.buttoncolor[] = themed_button_color(direction == :axis_x)
+        btn_2d_average_axis_y.buttoncolor[] = themed_button_color(direction == :axis_y)
+        update_2d_average_display!()
+    end
+
+    function set_2d_average_mode!(mode::Symbol)
+        mode in (:prime, :time_mean) || error("Unsupported 2D average display mode $(mode).")
+        two_d_average_mode[] = mode
+        btn_2d_average_prime.buttoncolor[] = themed_button_color(mode == :prime)
+        btn_2d_average_time_mean.buttoncolor[] = themed_button_color(mode == :time_mean)
+        update_2d_average_plot_visibility!()
+        set_2d_average_controls_visibility!(current_view_mode[] == :two_d_average)
+        if current_view_mode[] == :two_d_average
+            panel_height = mode == :prime ? TWO_D_AVERAGE_CONTROL_PANEL_HEIGHT : TWO_D_TIME_AVERAGE_CONTROL_PANEL_HEIGHT
+            rowsize!(root_layout, 7, Fixed(panel_height))
+        end
     end
 
     function set_slice_plane!(plane::Symbol)
@@ -3288,6 +4077,8 @@ function main(;
         show_prime = mode == :prime
         show_average_profile = mode == :average_profile
         show_2d_data = mode == :two_d_data
+        show_2d_average = mode == :two_d_average
+        show_2d_exports = mode == :two_d_exports
         show_velocity_stress = mode == :velocity_stress
         show_exports = mode == :exports
 
@@ -3313,6 +4104,7 @@ function main(;
         mesh_2d.visible[] = show_2d_data
         cbar_2d.blockscene.visible[] = show_2d_data
         two_d_note.visible[] = false
+        update_2d_average_plot_visibility!()
         for ax in velocity_stress_axes
             ax.scene.visible[] = show_velocity_stress
             ax.blockscene.visible[] = show_velocity_stress
@@ -3327,6 +4119,8 @@ function main(;
         set_prime_controls_visibility!(show_prime)
         set_average_profile_controls_visibility!(show_average_profile)
         set_2d_controls_visibility!(show_2d_data)
+        set_2d_average_controls_visibility!(show_2d_average)
+        set_2d_export_controls_visibility!(show_2d_exports)
         set_export_controls_visibility!(show_exports)
 
         btn_cloud.buttoncolor[] = themed_button_color(show_cloud)
@@ -3334,9 +4128,12 @@ function main(;
         btn_prime.buttoncolor[] = themed_button_color(show_prime)
         btn_average_profile.buttoncolor[] = themed_button_color(show_average_profile)
         btn_2d_data.buttoncolor[] = themed_button_color(show_2d_data)
+        btn_2d_average.buttoncolor[] = themed_button_color(show_2d_average)
+        btn_2d_exports.buttoncolor[] = themed_button_color(show_2d_exports)
         btn_velocity_stress.buttoncolor[] = themed_button_color(show_velocity_stress)
         btn_exports.buttoncolor[] = themed_button_color(show_exports)
 
+        rowsize!(root_layout, 7, Fixed(0))
         if show_cloud
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
@@ -3366,11 +4163,249 @@ function main(;
             rowsize!(root_layout, 5, Fixed(0))
             rowsize!(root_layout, 6, Fixed(TWO_D_CONTROL_PANEL_HEIGHT))
             update_2d_plot_display!()
+        elseif show_2d_average
+            rowsize!(root_layout, 3, Fixed(0))
+            rowsize!(root_layout, 4, Fixed(0))
+            rowsize!(root_layout, 5, Fixed(0))
+            rowsize!(root_layout, 6, Fixed(0))
+            panel_height =
+                two_d_average_mode[] == :prime ?
+                TWO_D_AVERAGE_CONTROL_PANEL_HEIGHT :
+                TWO_D_TIME_AVERAGE_CONTROL_PANEL_HEIGHT
+            rowsize!(root_layout, 7, Fixed(panel_height))
+            update_2d_average_display!()
         else
             rowsize!(root_layout, 3, Fixed(0))
             rowsize!(root_layout, 4, Fixed(0))
             rowsize!(root_layout, 5, Fixed(0))
             rowsize!(root_layout, 6, Fixed(0))
+        end
+    end
+
+    function save_export_plot!(paths, output_dir, plot_figure; prefix)
+        result = save_plot_figure_to_png(plot_figure, output_dir; prefix = prefix)
+        push!(paths, result.path)
+        return result.path
+    end
+
+    function export_current_3d_plots_to_png(output_dir)
+        mkpath(output_dir)
+        paths = String[]
+
+        render_index = render_snapshot_index[]
+        render_snapshot = snapshots[render_index]
+        enabled_render_fields = [
+            field_name
+            for field_name in render_field_names
+            if render_checkbox_by_field[field_name].checked[]
+        ]
+        render_layers = [
+            (field_name, get_render_frames(field_name)[render_index].q_rgba)
+            for field_name in enabled_render_fields
+        ]
+        render_fields_component =
+            isempty(enabled_render_fields) ?
+            "none" :
+            join(plot_file_component.(enabled_render_fields), "_")
+        save_export_plot!(
+            paths,
+            output_dir,
+            build_volume_render_publication_figure(xgrid, ygrid, zgrid, render_layers; time = render_snapshot.time);
+            prefix = "3d_volume_t$(number_file_component(render_snapshot.time))_$(render_fields_component)",
+        )
+
+        slice_state = selected_slice_data[]
+        slice_plane_value = slice_plane[]
+        slice_xcoords_value, slice_ycoords_value, slice_xlabel, slice_ylabel =
+            slice_plane_axes(slice_plane_value, slice_state.xgrid, slice_state.ygrid, slice_state.zgrid)
+        slice_fixed_axis, slice_fixed_value =
+            slice_fixed_coordinate(slice_plane_value, x_value[], y_value[], z_value[])
+        slice_values = volume_slice(
+            slice_state.plotted_volume,
+            slice_plane_value,
+            slice_state.xgrid,
+            slice_state.ygrid,
+            slice_state.zgrid,
+            x_value[],
+            y_value[],
+            z_value[],
+        )
+        slice_field_name = selected_slice_field[]
+        save_export_plot!(
+            paths,
+            output_dir,
+            build_heatmap_publication_figure(
+                slice_xcoords_value,
+                slice_ycoords_value,
+                slice_values;
+                title = "$(slice_axis_title(slice_field_name, slice_plane_value)), $(time_label(slice_state.time)), $(slice_fixed_axis) = $(round(slice_fixed_value, digits = 2)) m",
+                xlabel = slice_xlabel,
+                ylabel = slice_ylabel,
+                colorbar_label = slice_field_name,
+                colormap = slice_state.colormap,
+                colorrange = slice_state.colorrange,
+            );
+            prefix = "3d_slice_$(slice_plane_value)_$(plot_file_component(slice_field_name))_t$(number_file_component(slice_state.time))_$(slice_fixed_axis)$(number_file_component(slice_fixed_value))",
+        )
+
+        prime_state = selected_prime_data[]
+        prime_plane_value = prime_slice_plane[]
+        prime_xcoords_value, prime_ycoords_value, prime_xlabel, prime_ylabel =
+            slice_plane_axes(prime_plane_value, prime_state.xgrid, prime_state.ygrid, prime_state.zgrid)
+        prime_fixed_axis, prime_fixed_value =
+            slice_fixed_coordinate(prime_plane_value, prime_x_value[], prime_y_value[], prime_z_value[])
+        prime_values = volume_slice(
+            prime_state.plotted_prime_volume,
+            prime_plane_value,
+            prime_state.xgrid,
+            prime_state.ygrid,
+            prime_state.zgrid,
+            prime_x_value[],
+            prime_y_value[],
+            prime_z_value[],
+        )
+        prime_field_name = selected_prime_field[]
+        prime_time = snapshots[prime_snapshot_index[]].time
+        save_export_plot!(
+            paths,
+            output_dir,
+            build_heatmap_publication_figure(
+                prime_xcoords_value,
+                prime_ycoords_value,
+                prime_values;
+                title = "$(prime_axis_title(prime_field_name, prime_plane_value)), $(time_label(prime_time)), $(prime_fixed_axis) = $(round(prime_fixed_value, digits = 2)) m",
+                xlabel = prime_xlabel,
+                ylabel = prime_ylabel,
+                colorbar_label = prime_field_label(prime_field_name),
+                colormap = :balance,
+                colorrange = get_prime_colorrange(prime_field_name),
+            );
+            prefix = "3d_prime_$(prime_plane_value)_$(plot_file_component(prime_field_name))_t$(number_file_component(prime_time))_$(prime_fixed_axis)$(number_file_component(prime_fixed_value))",
+        )
+
+        average_field_name = selected_average_profile_field[]
+        average_direction_value = average_profile_direction[]
+        average_state = get_average_profile_data(average_field_name, average_direction_value)
+        average_xlabel, average_ylabel = average_profile_axes(average_direction_value)
+        save_export_plot!(
+            paths,
+            output_dir,
+            build_heatmap_publication_figure(
+                average_state.xcoords,
+                average_state.ycoords,
+                average_state.profile;
+                title = average_profile_title(average_field_name, average_direction_value),
+                xlabel = average_xlabel,
+                ylabel = average_ylabel,
+                colorbar_label = average_profile_label(average_field_name, average_direction_value),
+                colormap = average_state.colormap,
+                colorrange = average_state.colorrange,
+            );
+            prefix = "3d_mean_profile_$(plot_file_component(average_field_name))_avg_$(average_direction_value)",
+        )
+
+        save_export_plot!(
+            paths,
+            output_dir,
+            build_velocity_stress_publication_figure(velocity_stress_data);
+            prefix = "3d_velocity_stress_profiles",
+        )
+        return (
+            dir = output_dir,
+            paths = paths,
+        )
+    end
+
+    function export_current_2d_plots_to_png(output_dir)
+        mkpath(output_dir)
+        paths = String[]
+
+        two_d_field_name = selected_2d_field[]
+        two_d_snapshot = selected_2d_snapshot[]
+        two_d_colormap_value, two_d_colorrange_value = two_d_field_style_by_field[two_d_field_name]
+        save_export_plot!(
+            paths,
+            output_dir,
+            build_2d_publication_figure(
+                two_d_series,
+                two_d_snapshot,
+                two_d_field_name;
+                colormap = two_d_colormap_value,
+                colorrange = two_d_colorrange_value,
+            );
+            prefix = "2d_data_$(plot_file_component(two_d_snapshot.label))_$(plot_file_component(two_d_field_name))",
+        )
+
+        average_field_name = selected_2d_average_field[]
+        average_direction_value = two_d_average_direction[]
+        average_state = get_two_d_average_data(average_field_name, average_direction_value)
+        average_axis = two_d_axis_short_name(two_d_average_axis_label(two_d_series, average_direction_value))
+        if two_d_average_mode[] == :prime
+            average_snapshot = two_d_series.snapshots[two_d_average_snapshot_index[]]
+            average_figure = build_2d_publication_figure(
+                two_d_series,
+                average_snapshot,
+                average_field_name;
+                values = average_state.prime_values_by_snapshot[two_d_average_snapshot_index[]],
+                title = two_d_prime_title(two_d_series, average_field_name, average_snapshot, average_direction_value),
+                colorbar_label = prime_field_label(average_field_name),
+                colormap = :balance,
+                colorrange = average_state.prime_colorrange,
+            )
+            average_prefix = "2d_average_prime_$(plot_file_component(average_axis))_avg_$(plot_file_component(average_snapshot.label))_$(plot_file_component(average_field_name))"
+        else
+            average_figure = build_2d_time_average_profile_publication_figure(
+                two_d_series,
+                average_state,
+                average_field_name,
+                average_direction_value,
+            )
+            average_prefix = "2d_average_time_mean_$(plot_file_component(average_axis))_avg_$(plot_file_component(average_field_name))"
+        end
+        save_export_plot!(paths, output_dir, average_figure; prefix = average_prefix)
+        return (
+            dir = output_dir,
+            paths = paths,
+        )
+    end
+
+    function export_current_png_plots!(button, running, status_text, path_textbox, normalize_output_dir, export_plots)
+        running[] && return
+
+        running[] = true
+        button.label[] = "Exporting..."
+        status_text[] = "Exporting..."
+
+        try
+            output_dir = normalize_output_dir(path_textbox.displayed_string[])
+            result = export_plots(output_dir)
+            status_text[] = "Export complete: $(length(result.paths)) PNGs in $(result.dir)"
+        catch err
+            status_text[] = "Export failed: $(sprint(showerror, err))"
+        finally
+            button.label[] = "Export PNGs"
+            running[] = false
+        end
+    end
+
+    function export_netcdf_async!(button, running, status_text, path_textbox, normalize_output_path, export_data)
+        running[] && return
+
+        running[] = true
+        button.label[] = "Exporting..."
+        status_text[] = "Exporting..."
+        output_path = normalize_output_path(path_textbox.displayed_string[])
+
+        @async begin
+            try
+                result = export_data(output_path)
+                status_text[] = "Export complete: $(result.path)"
+            catch err
+                status_text[] = "Export failed: $(sprint(showerror, err))"
+            finally
+                button.label[] = "Export to NetCDF"
+                running[] = false
+            end
         end
     end
 
@@ -3380,31 +4415,30 @@ function main(;
     end
 
     on(export_button.clicks) do _
-        export_running[] && return
-
-        export_running[] = true
-        export_button.label[] = "Exporting..."
-
-        requested_path = export_path_textbox.displayed_string[]
-        output_path = normalized_netcdf_output_path(requested_path)
-        export_status_text[] = "Exporting..."
-
-        @async begin
-            try
-                result = export_snapshot_series_to_netcdf(
+        export_netcdf_async!(
+            export_button,
+            export_running,
+            export_status_text,
+            export_path_textbox,
+            normalized_netcdf_output_path,
+            output_path -> export_snapshot_series_to_netcdf(
                     snapshot_series,
                     output_path;
                     field_names = prime_field_names,
                     round_digits = ROUND_DIGITS,
-                )
-                export_status_text[] = "Export complete: $(result.path)"
-            catch err
-                export_status_text[] = "Export failed: $(sprint(showerror, err))"
-            finally
-                export_button.label[] = "Export to NetCDF"
-                export_running[] = false
-            end
-        end
+                ),
+        )
+    end
+
+    on(png_export_button.clicks) do _
+        export_current_png_plots!(
+            png_export_button,
+            png_export_running,
+            export_status_text,
+            png_export_path_textbox,
+            normalized_3d_png_output_dir,
+            export_current_3d_plots_to_png,
+        )
     end
 
     on(average_profile_field_menu.selection) do field_name
@@ -3426,36 +4460,42 @@ function main(;
         set_2d_field!(field_name)
     end
 
+    on(two_d_average_time_slider.value) do v
+        two_d_average_snapshot_index[] = Int(v) + 1
+        update_2d_average_display!()
+    end
+
+    on(two_d_average_field_menu.selection) do field_name
+        isnothing(field_name) && return
+        close_menu!(two_d_average_field_menu)
+        set_2d_average_field!(field_name)
+    end
+
     on(two_d_export_button.clicks) do _
-        two_d_export_running[] && return
+        export_current_png_plots!(
+            two_d_export_button,
+            two_d_export_running,
+            two_d_export_status_text,
+            two_d_export_path_textbox,
+            normalized_2d_png_output_dir,
+            export_current_2d_plots_to_png,
+        )
+    end
 
-        two_d_export_running[] = true
-        two_d_export_button.label[] = "Exporting..."
-
-        requested_dir = two_d_export_path_textbox.displayed_string[]
-        output_dir = normalized_2d_png_output_dir(requested_dir)
-        two_d_export_status_text[] = "Exporting..."
-
-        @async begin
-            try
-                result = export_2d_plots_to_png_subprocess(
-                    output_dir;
-                    data_path = DEFAULT_2D_DATA_DIR,
-                    field_names = two_d_series.field_names,
-                    px_per_unit = PUBLICATION_2D_PX_PER_UNIT,
-                )
-                two_d_export_status_text[] = "Export complete: $(result.count) PNGs in $(result.dir)"
-            catch err
-                two_d_export_status_text[] = "Export failed: $(sprint(showerror, err))"
-            finally
-                two_d_export_button.label[] = "Export PNGs"
-                two_d_export_running[] = false
-                if !isnothing(LAST_FIGURE[])
-                    LAST_SCREEN[] = display(LAST_FIGURE[])
-                    set_view_mode!(current_view_mode[])
-                end
-            end
-        end
+    on(two_d_netcdf_export_button.clicks) do _
+        export_netcdf_async!(
+            two_d_netcdf_export_button,
+            two_d_netcdf_export_running,
+            two_d_export_status_text,
+            two_d_netcdf_export_path_textbox,
+            normalized_2d_netcdf_output_path,
+            output_path -> export_two_d_snapshot_series_to_netcdf(
+                two_d_series,
+                output_path;
+                field_names = two_d_series.field_names,
+                round_digits = ROUND_DIGITS,
+            ),
+        )
     end
 
     on(btn_cloud.clicks) do _
@@ -3472,6 +4512,12 @@ function main(;
     end
     on(btn_2d_data.clicks) do _
         set_view_mode!(:two_d_data)
+    end
+    on(btn_2d_average.clicks) do _
+        set_view_mode!(:two_d_average)
+    end
+    on(btn_2d_exports.clicks) do _
+        set_view_mode!(:two_d_exports)
     end
     on(btn_velocity_stress.clicks) do _
         set_view_mode!(:velocity_stress)
@@ -3506,12 +4552,26 @@ function main(;
     on(btn_average_z.clicks) do _
         set_average_profile_direction!(:z)
     end
+    on(btn_2d_average_prime.clicks) do _
+        set_2d_average_mode!(:prime)
+    end
+    on(btn_2d_average_time_mean.clicks) do _
+        set_2d_average_mode!(:time_mean)
+    end
+    on(btn_2d_average_axis_x.clicks) do _
+        set_2d_average_direction!(:axis_x)
+    end
+    on(btn_2d_average_axis_y.clicks) do _
+        set_2d_average_direction!(:axis_y)
+    end
 
     apply_theme!()
     set_slice_plane!(:xy)
     set_prime_slice_plane!(:xy)
     set_average_profile_direction!(default_average_profile_direction)
     update_2d_plot_display!()
+    set_2d_average_direction!(default_2d_average_direction)
+    set_2d_average_mode!(:prime)
     set_view_mode!(:slice)
 
     if display_figure
