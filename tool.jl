@@ -137,6 +137,63 @@ struct NetCDFVariableSpec
     begin_offset::Int
 end
 
+function placeholder_snapshot_series()
+    x = Float64[]
+    y = Float64[]
+    z = Float64[]
+    for z_value in (0.0, 1.0), y_value in (0.0, 1.0), x_value in (0.0, 1.0)
+        push!(x, x_value)
+        push!(y, y_value)
+        push!(z, z_value)
+    end
+
+    field_names = copy(DEFAULT_FIELD_ORDER)
+    fields = Dict(field_name => zeros(Float32, length(x)) for field_name in field_names)
+    snapshot = SnapshotState(0.0, "No 3D data", fields)
+    return SnapshotSeries(
+        x,
+        y,
+        z,
+        field_names,
+        snapshot,
+        SnapshotState[snapshot],
+        :single,
+        "No 3D data",
+    )
+end
+
+function placeholder_two_d_snapshot_series()
+    axis_x = Float64[0.0, 1.0, 1.0, 0.0]
+    axis_y = Float64[0.0, 0.0, 1.0, 1.0]
+    points = Point2f[
+        Point2f(0, 0),
+        Point2f(1, 0),
+        Point2f(1, 1),
+        Point2f(0, 1),
+    ]
+    faces = Makie.TriangleFace{Int}[
+        Makie.TriangleFace{Int}(1, 2, 3),
+        Makie.TriangleFace{Int}(1, 3, 4),
+    ]
+    field_names = String["u", "w", "p", "T"]
+    fields = Dict(field_name => zeros(Float32, length(points)) for field_name in field_names)
+    snapshot = SnapshotState(0.0, "No 2D data", fields)
+    return TwoDSnapshotSeries(
+        axis_x,
+        axis_y,
+        points,
+        faces,
+        "x (m)",
+        "y (m)",
+        field_names,
+        snapshot,
+        SnapshotState[snapshot],
+        :single,
+        "No 2D data",
+        DATA_DIR,
+    )
+end
+
 const NC_ZERO = UInt32(0)
 const NC_DIMENSION = UInt32(10)
 const NC_VARIABLE = UInt32(11)
@@ -285,15 +342,72 @@ function build_cloud_frames(snapshot_series::SnapshotSeries; field_name = DEFAUL
     return frame_grid.xgrid, frame_grid.ygrid, frame_grid.zgrid, frames
 end
 
-function load_point_dataset(vtu_path)
+function point_data_values(point_data, field_name)
+    field_data = point_data[field_name]
+    values = field_data isa AbstractArray ? field_data : get_data(field_data)
+    return vec(Float32.(values))
+end
+
+function require_matching_piece_fields(reference_fields, point_data, source_path)
+    available_fields = point_field_names(point_data)
+    Set(available_fields) == Set(reference_fields) || error(
+        "Point-data fields in $(source_path) do not match the first VTU piece. " *
+        "Expected: " * join(reference_fields, ", ") *
+        ". Available: " * join(available_fields, ", "),
+    )
+end
+
+function load_single_point_dataset(vtu_path)
     vtk = VTKFile(vtu_path)
     points = get_points(vtk)
     point_data = get_point_data(vtk)
 
-    x = vec(points[1, :])
-    y = vec(points[2, :])
-    z = vec(points[3, :])
+    x = vec(Float64.(points[1, :]))
+    y = vec(Float64.(points[2, :]))
+    z = vec(Float64.(points[3, :]))
     return x, y, z, point_data
+end
+
+function load_point_dataset(vtk_reference)
+    paths = vtk_data_piece_paths(vtk_reference)
+    length(paths) == 1 && return load_single_point_dataset(only(paths))
+
+    x_parts = Vector{Vector{Float64}}()
+    y_parts = Vector{Vector{Float64}}()
+    z_parts = Vector{Vector{Float64}}()
+    field_parts = Dict{String, Vector{Vector{Float32}}}()
+    reference_fields = String[]
+
+    for (piece_index, path) in enumerate(paths)
+        x_i, y_i, z_i, point_data_i = load_single_point_dataset(path)
+        if piece_index == 1
+            reference_fields = point_field_names(point_data_i)
+            isempty(reference_fields) && error("No point-data fields were found in $(path).")
+            for field_name in reference_fields
+                field_parts[field_name] = Vector{Vector{Float32}}()
+            end
+        else
+            require_matching_piece_fields(reference_fields, point_data_i, path)
+        end
+
+        push!(x_parts, x_i)
+        push!(y_parts, y_i)
+        push!(z_parts, z_i)
+        for field_name in reference_fields
+            values = point_data_values(point_data_i, field_name)
+            length(values) == length(x_i) || error(
+                "Point-data field $(repr(field_name)) in $(path) has $(length(values)) values, " *
+                "but the piece has $(length(x_i)) points.",
+            )
+            push!(field_parts[field_name], values)
+        end
+    end
+
+    point_data = Dict(
+        field_name => vcat(field_parts[field_name]...)
+        for field_name in reference_fields
+    )
+    return vcat(x_parts...), vcat(y_parts...), vcat(z_parts...), point_data
 end
 
 function format_time(time::Real)
@@ -317,10 +431,10 @@ function resolve_relative_path(container_path, referenced_path)
     return isabspath(referenced_path) ? normpath(referenced_path) : normpath(joinpath(dirname(container_path), referenced_path))
 end
 
-function resolve_vtk_data_path(vtk_path)
+function resolve_vtk_data_paths(vtk_path)
     ext = lowercase(splitext(vtk_path)[2])
     if ext == ".vtu"
-        return vtk_path
+        return [vtk_path]
     elseif ext == ".pvtu"
         xml = read(vtk_path, String)
         pieces = String[]
@@ -331,11 +445,23 @@ function resolve_vtk_data_path(vtk_path)
         end
 
         isempty(pieces) && error("No VTU Piece Source entries were found in $(vtk_path).")
-        length(pieces) == 1 || error("$(vtk_path) references $(length(pieces)) VTU pieces; this tool currently expects one piece per timestep.")
-        return only(pieces)
+        return pieces
     end
 
     error("Unsupported VTK data file extension $(repr(ext)) for $(vtk_path). Expected .vtu or .pvtu.")
+end
+
+function resolve_vtk_data_path(vtk_path)
+    paths = resolve_vtk_data_paths(vtk_path)
+    return length(paths) == 1 ? only(paths) : paths
+end
+
+vtk_data_piece_paths(vtk_path::AbstractString) = resolve_vtk_data_paths(vtk_path)
+
+function vtk_data_piece_paths(vtk_paths)
+    paths = String.(collect(vtk_paths))
+    isempty(paths) && error("No VTU piece paths were provided.")
+    return paths
 end
 
 function parse_pvd_entries(pvd_path)
@@ -358,6 +484,26 @@ function parse_pvd_entries(pvd_path)
 end
 
 function dataset_entries(data_path)
+    if isdir(data_path)
+        pvd_path = joinpath(data_path, "simulation.pvd")
+        if isfile(pvd_path)
+            raw_entries = parse_pvd_entries(pvd_path)
+            entries = [(time = entry.time, path = resolve_vtk_data_path(entry.path)) for entry in raw_entries]
+            sort!(entries, by = entry -> entry.time)
+            return entries
+        end
+
+        files = root_vtk_data_files(data_path)
+        isempty(files) && error("No simulation.pvd, .pvtu, or .vtu files were found at the top level of $(data_path).")
+
+        return [
+            (
+                time = Float64(something(parse_iteration_number(path), idx - 1)),
+                path = resolve_vtk_data_path(path),
+            ) for (idx, path) in enumerate(files)
+        ]
+    end
+
     ext = lowercase(splitext(data_path)[2])
     raw_entries =
         if ext == ".pvd"
@@ -385,7 +531,7 @@ function vtk_entry_sort_key(path)
 end
 
 function root_vtk_data_files(data_dir)
-    isdir(data_dir) || error("Could not find 2D data directory at $(data_dir).")
+    isdir(data_dir) || error("Could not find data directory at $(data_dir).")
 
     files = [
         path for path in readdir(data_dir; join = true)
@@ -475,25 +621,40 @@ function two_d_points(x, y, z, axis_indices)
     ]
 end
 
-function vtk_triangle_faces(vtu_path)
-    vtk = VTKFile(vtu_path)
-    mesh_cells = ReadVTK.to_meshcells(get_cells(vtk))
+function vtk_triangle_faces(vtk_reference)
+    paths = vtk_data_piece_paths(vtk_reference)
     faces = Makie.TriangleFace{Int}[]
+    point_offset = 0
 
-    for cell in mesh_cells
-        conn = cell.connectivity
-        length(conn) >= 3 || continue
+    for path in paths
+        vtk = VTKFile(path)
+        mesh_cells = ReadVTK.to_meshcells(get_cells(vtk))
 
-        if length(conn) == 3
-            push!(faces, Makie.TriangleFace{Int}(conn[1], conn[2], conn[3]))
-        else
-            for i in 2:(length(conn) - 1)
-                push!(faces, Makie.TriangleFace{Int}(conn[1], conn[i], conn[i + 1]))
+        for cell in mesh_cells
+            conn = cell.connectivity
+            length(conn) >= 3 || continue
+
+            if length(conn) == 3
+                push!(faces, Makie.TriangleFace{Int}(
+                    conn[1] + point_offset,
+                    conn[2] + point_offset,
+                    conn[3] + point_offset,
+                ))
+            else
+                for i in 2:(length(conn) - 1)
+                    push!(faces, Makie.TriangleFace{Int}(
+                        conn[1] + point_offset,
+                        conn[i] + point_offset,
+                        conn[i + 1] + point_offset,
+                    ))
+                end
             end
         end
+
+        point_offset += size(get_points(vtk), 2)
     end
 
-    isempty(faces) && error("No 2D triangle faces could be built from $(vtu_path).")
+    isempty(faces) && error("No 2D triangle faces could be built from $(vtk_reference).")
     return faces
 end
 
@@ -563,7 +724,7 @@ function get_scalar_field_values(point_data, field_name)
     field_name in field_names || error(
         "Field $(repr(field_name)) was not found. Available point-data fields: " * join(field_names, ", "),
     )
-    return Float32.(get_data(point_data[field_name]))
+    return point_data_values(point_data, field_name)
 end
 
 function point_field_value_dict(point_data; field_names = point_field_names(point_data))
@@ -2210,15 +2371,22 @@ end
 
 function main(;
     data_path = DEFAULT_DATA_PATH,
+    two_d_data_path = DEFAULT_2D_DATA_DIR,
+    use_3d_data = true,
+    use_2d_data = true,
     display_figure = true,
     wait_for_window = true,
 )
-    isfile(data_path) || error("Could not find data file at $(data_path).")
-    if display_figure
-        println("Loading $(basename(data_path))...")
+    use_3d_data || use_2d_data || error("Select at least one data type to launch the tool.")
+
+    if use_3d_data
+        (isfile(data_path) || isdir(data_path)) || error("Could not find 3D data file or directory at $(data_path).")
+        if display_figure
+            println("Loading 3D VTK data from $(basename(normpath(data_path)))...")
+        end
     end
 
-    snapshot_series = load_snapshot_series(data_path)
+    snapshot_series = use_3d_data ? load_snapshot_series(data_path) : placeholder_snapshot_series()
     x = snapshot_series.x
     y = snapshot_series.y
     z = snapshot_series.z
@@ -2234,7 +2402,7 @@ function main(;
     render_field_names = copy(prime_field_names)
     default_render_field_name = DEFAULT_VOLUME_FIELD_NAME in render_field_names ? DEFAULT_VOLUME_FIELD_NAME : first(render_field_names)
 
-    if display_figure
+    if display_figure && use_3d_data
         println("Precomputing 3D render layers for $(length(render_field_names)) point-data variables...")
     end
 
@@ -2276,7 +2444,7 @@ function main(;
     cloud_frames = get_render_frames(default_render_field_name)
     default_cloud_frame = cloud_frames[default_snapshot_index]
 
-    if display_figure
+    if display_figure && use_3d_data
         println("Precomputing variable' fields for $(length(prime_field_names)) point-data variables...")
     end
 
@@ -2310,7 +2478,7 @@ function main(;
         get_prime_data(field_name, default_snapshot_index)
     end
     get_prime_colorrange(default_prime_field_name)
-    if display_figure
+    if display_figure && use_3d_data
         println("Finished precomputing variable' fields.")
         println("Precomputing time-averaged 2D profiles for $(length(prime_field_names)) point-data variables in 3 directions...")
     end
@@ -2324,7 +2492,7 @@ function main(;
         end
     end
 
-    if display_figure
+    if display_figure && use_3d_data
         println("Finished precomputing time-averaged 2D profiles.")
         println(
             "Computing time-averaged <a' b'>_xy(z) profiles for a,b in {u,v,w} using $(length(snapshot_series.snapshots)) " *
@@ -2344,10 +2512,13 @@ function main(;
     default_average_profile_direction = :z
     default_average_profile_data = get_average_profile_data(default_average_profile_field_name, default_average_profile_direction)
 
-    if display_figure
-        println("Loading 2D VTK data from $(DEFAULT_2D_DATA_DIR)...")
+    if use_2d_data
+        (isfile(two_d_data_path) || isdir(two_d_data_path)) || error("Could not find 2D data file or directory at $(two_d_data_path).")
+        if display_figure
+            println("Loading 2D VTK data from $(two_d_data_path)...")
+        end
     end
-    two_d_series = load_2d_snapshot_series(DEFAULT_2D_DATA_DIR)
+    two_d_series = use_2d_data ? load_2d_snapshot_series(two_d_data_path) : placeholder_two_d_snapshot_series()
     two_d_field_style_by_field = Dict(
         field_name => global_field_colormap_and_range(two_d_series.snapshots, field_name)
         for field_name in two_d_series.field_names
@@ -2387,6 +2558,30 @@ function main(;
     dark_mode_caption = Label(toolbar[1, 10], "Dark mode:", color = APP_TEXT_COLOR)
     dark_mode_checkbox = Checkbox(toolbar[1, 11]; checked = false)
     colgap!(toolbar, 10)
+
+    if !use_3d_data
+        for (button, col) in (
+            (btn_cloud, 1),
+            (btn_slice, 2),
+            (btn_prime, 3),
+            (btn_average_profile, 4),
+            (btn_velocity_stress, 5),
+            (btn_exports, 6),
+        )
+            button.blockscene.visible[] = false
+            colsize!(toolbar, col, Fixed(0))
+        end
+    end
+    if !use_2d_data
+        for (button, col) in (
+            (btn_2d_data, 7),
+            (btn_2d_average, 8),
+            (btn_2d_exports, 9),
+        )
+            button.blockscene.visible[] = false
+            colsize!(toolbar, col, Fixed(0))
+        end
+    end
 
     main_layout = GridLayout(
         root_layout[2, 1];
@@ -2456,7 +2651,8 @@ function main(;
     colsize!(exports_panel, 1, Relative(1))
     colsize!(cloud_panel, 1, Relative(1))
 
-    current_view_mode = Ref(:slice)
+    initial_view_mode = use_3d_data ? :slice : :two_d_data
+    current_view_mode = Ref(initial_view_mode)
     render_snapshot_index = Observable(default_snapshot_index)
     render_rgba_by_field = Dict(
         field_name => Observable(get_render_frames(field_name)[default_snapshot_index].q_rgba)
@@ -4499,31 +4695,31 @@ function main(;
     end
 
     on(btn_cloud.clicks) do _
-        set_view_mode!(:cloud)
+        use_3d_data && set_view_mode!(:cloud)
     end
     on(btn_slice.clicks) do _
-        set_view_mode!(:slice)
+        use_3d_data && set_view_mode!(:slice)
     end
     on(btn_prime.clicks) do _
-        set_view_mode!(:prime)
+        use_3d_data && set_view_mode!(:prime)
     end
     on(btn_average_profile.clicks) do _
-        set_view_mode!(:average_profile)
+        use_3d_data && set_view_mode!(:average_profile)
     end
     on(btn_2d_data.clicks) do _
-        set_view_mode!(:two_d_data)
+        use_2d_data && set_view_mode!(:two_d_data)
     end
     on(btn_2d_average.clicks) do _
-        set_view_mode!(:two_d_average)
+        use_2d_data && set_view_mode!(:two_d_average)
     end
     on(btn_2d_exports.clicks) do _
-        set_view_mode!(:two_d_exports)
+        use_2d_data && set_view_mode!(:two_d_exports)
     end
     on(btn_velocity_stress.clicks) do _
-        set_view_mode!(:velocity_stress)
+        use_3d_data && set_view_mode!(:velocity_stress)
     end
     on(btn_exports.clicks) do _
-        set_view_mode!(:exports)
+        use_3d_data && set_view_mode!(:exports)
     end
     on(btn_xy.clicks) do _
         set_slice_plane!(:xy)
@@ -4566,13 +4762,17 @@ function main(;
     end
 
     apply_theme!()
-    set_slice_plane!(:xy)
-    set_prime_slice_plane!(:xy)
-    set_average_profile_direction!(default_average_profile_direction)
-    update_2d_plot_display!()
-    set_2d_average_direction!(default_2d_average_direction)
-    set_2d_average_mode!(:prime)
-    set_view_mode!(:slice)
+    if use_3d_data
+        set_slice_plane!(:xy)
+        set_prime_slice_plane!(:xy)
+        set_average_profile_direction!(default_average_profile_direction)
+    end
+    if use_2d_data
+        update_2d_plot_display!()
+        set_2d_average_direction!(default_2d_average_direction)
+        set_2d_average_mode!(:prime)
+    end
+    set_view_mode!(initial_view_mode)
 
     if display_figure
         println("Opening Makie window...")
@@ -4585,14 +4785,229 @@ function main(;
     return fig
 end
 
+function launcher_data_path(path; default_dir)
+    cleaned_path = strip(String(path))
+    isempty(cleaned_path) && (cleaned_path = default_dir)
+    return normpath(isabspath(cleaned_path) ? cleaned_path : joinpath(DATA_DIR, cleaned_path))
+end
+
+function launcher_start_directory(path; default_dir)
+    candidate = launcher_data_path(path; default_dir = default_dir)
+    isdir(candidate) && return candidate
+    isfile(candidate) && return dirname(candidate)
+    parent = dirname(candidate)
+    return isdir(parent) ? parent : default_dir
+end
+
+function validate_launcher_config(data_path, two_d_data_path, use_3d_data::Bool, use_2d_data::Bool)
+    use_3d_data || use_2d_data || error("Select 3D data, 2D data, or both before launching.")
+
+    resolved_3d_path = launcher_data_path(data_path; default_dir = DATA_DIR)
+    resolved_2d_path = launcher_data_path(two_d_data_path; default_dir = DEFAULT_2D_DATA_DIR)
+
+    if use_3d_data
+        (isdir(resolved_3d_path) || isfile(resolved_3d_path)) || error("Could not find 3D data at $(resolved_3d_path).")
+        dataset_entries(resolved_3d_path)
+    end
+    if use_2d_data
+        (isdir(resolved_2d_path) || isfile(resolved_2d_path)) || error("Could not find 2D data at $(resolved_2d_path).")
+        two_d_dataset_entries(resolved_2d_path)
+    end
+
+    return (
+        data_path = resolved_3d_path,
+        two_d_data_path = resolved_2d_path,
+        use_3d_data = use_3d_data,
+        use_2d_data = use_2d_data,
+    )
+end
+
+function applescript_literal(value)
+    escaped = replace(String(value), "\\" => "\\\\", "\"" => "\\\"")
+    return "\"$(escaped)\""
+end
+
+function choose_directory_dialog(start_dir; prompt = "Select data folder")
+    try
+        if Sys.isapple()
+            script = """
+            set startFolder to POSIX file $(applescript_literal(start_dir))
+            try
+                set chosenFolder to choose folder with prompt $(applescript_literal(prompt)) default location startFolder
+                POSIX path of chosenFolder
+            on error number -128
+                return ""
+            end try
+            """
+            output = strip(read(`osascript -e $script`, String))
+            return isempty(output) ? nothing : normpath(output)
+        elseif Sys.islinux()
+            if success(`which zenity`)
+                output = strip(read(`zenity --file-selection --directory --filename=$(start_dir)/ --title=$prompt`, String))
+                return isempty(output) ? nothing : normpath(output)
+            elseif success(`which kdialog`)
+                output = strip(read(`kdialog --getexistingdirectory $start_dir --title $prompt`, String))
+                return isempty(output) ? nothing : normpath(output)
+            end
+        elseif Sys.iswindows()
+            ps_script = """
+            Add-Type -AssemblyName System.Windows.Forms;
+            \$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;
+            \$dialog.Description = $(repr(prompt));
+            \$dialog.SelectedPath = $(repr(start_dir));
+            if (\$dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                Write-Output \$dialog.SelectedPath
+            }
+            """
+            output = strip(read(`powershell -NoProfile -Command $ps_script`, String))
+            return isempty(output) ? nothing : normpath(output)
+        end
+    catch
+        return nothing
+    end
+    return nothing
+end
+
+function set_textbox_string!(textbox, value)
+    textbox.stored_string[] = String(value)
+    textbox.displayed_string[] = String(value)
+end
+
+function launch_startup_gui(; wait_for_window = true)
+    default_3d_dir = isfile(DEFAULT_DATA_PATH) ? dirname(DEFAULT_DATA_PATH) : DATA_DIR
+    default_2d_dir = DEFAULT_2D_DATA_DIR
+    disabled_text_color = RGBf(0.50, 0.50, 0.50)
+    disabled_box_color = RGBf(0.90, 0.90, 0.90)
+
+    fig = Figure(size = (1120, 300), backgroundcolor = APP_BACKGROUND, fontsize = APP_FONT_SIZE)
+    colsize!(fig.layout, 1, Relative(1))
+    rowsize!(fig.layout, 1, Relative(1))
+
+    layout = GridLayout(fig[1, 1]; halign = :left, valign = :top)
+    colgap!(layout, 12)
+    rowgap!(layout, 12)
+
+    title = Label(layout[1, 1:5], "Select Data", color = APP_TEXT_COLOR, fontsize = AXIS_TITLE_SIZE, halign = :left)
+
+    three_d_label = Label(layout[2, 1], "3D data folder:", color = APP_TEXT_COLOR, halign = :right)
+    three_d_path = Textbox(layout[2, 2], stored_string = default_3d_dir, width = 430)
+    three_d_disabled = Label(layout[2, 2], "Disabled", color = disabled_text_color, visible = false, halign = :left)
+    three_d_browse = Button(layout[2, 3], label = "Browse", width = 92)
+    no_3d_checkbox = Checkbox(layout[2, 4]; checked = false)
+    no_3d_label = Label(layout[2, 5], "No 3D data", color = APP_TEXT_COLOR, halign = :left)
+
+    two_d_label = Label(layout[3, 1], "2D data folder:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_path = Textbox(layout[3, 2], stored_string = default_2d_dir, width = 430)
+    two_d_disabled = Label(layout[3, 2], "Disabled", color = disabled_text_color, visible = false, halign = :left)
+    two_d_browse = Button(layout[3, 3], label = "Browse", width = 92)
+    no_2d_checkbox = Checkbox(layout[3, 4]; checked = false)
+    no_2d_label = Label(layout[3, 5], "No 2D data", color = APP_TEXT_COLOR, halign = :left)
+
+    launch_button = Button(layout[4, 3], label = "Launch", width = 92)
+    status_text = Observable("")
+    status_label = Label(layout[5, 1:5], status_text, color = APP_TEXT_COLOR, tellwidth = false, halign = :left)
+
+    colsize!(layout, 1, Fixed(150))
+    colsize!(layout, 2, Fixed(430))
+    colsize!(layout, 3, Fixed(96))
+    colsize!(layout, 4, Fixed(24))
+    colsize!(layout, 5, Fixed(170))
+
+    screen_ref = Ref{Any}(nothing)
+    launch_config = Ref{Any}(nothing)
+
+    function set_source_enabled!(enabled, label, textbox, disabled_label, browse_button)
+        label.color[] = enabled ? APP_TEXT_COLOR : disabled_text_color
+        textbox.blockscene.visible[] = enabled
+        disabled_label.visible[] = !enabled
+        browse_button.blockscene.visible[] = enabled
+        textbox.boxcolor[] = enabled ? LIGHT_MENU_BACKGROUND : disabled_box_color
+        textbox.boxcolor_hover[] = enabled ? LIGHT_MENU_BACKGROUND : disabled_box_color
+        textbox.boxcolor_focused[] = enabled ? LIGHT_MENU_BACKGROUND : disabled_box_color
+        textbox.textcolor[] = enabled ? APP_TEXT_COLOR : disabled_text_color
+    end
+
+    function refresh_enabled_state!()
+        set_source_enabled!(!no_3d_checkbox.checked[], three_d_label, three_d_path, three_d_disabled, three_d_browse)
+        set_source_enabled!(!no_2d_checkbox.checked[], two_d_label, two_d_path, two_d_disabled, two_d_browse)
+    end
+
+    on(no_3d_checkbox.checked) do _
+        refresh_enabled_state!()
+    end
+    on(no_2d_checkbox.checked) do _
+        refresh_enabled_state!()
+    end
+
+    on(three_d_browse.clicks) do _
+        no_3d_checkbox.checked[] && return
+        start_dir = launcher_start_directory(three_d_path.displayed_string[]; default_dir = default_3d_dir)
+        selected_dir = choose_directory_dialog(start_dir; prompt = "Select 3D data folder")
+        isnothing(selected_dir) || set_textbox_string!(three_d_path, selected_dir)
+    end
+    on(two_d_browse.clicks) do _
+        no_2d_checkbox.checked[] && return
+        start_dir = launcher_start_directory(two_d_path.displayed_string[]; default_dir = default_2d_dir)
+        selected_dir = choose_directory_dialog(start_dir; prompt = "Select 2D data folder")
+        isnothing(selected_dir) || set_textbox_string!(two_d_path, selected_dir)
+    end
+
+    function request_launch!()
+        try
+            config = validate_launcher_config(
+                three_d_path.displayed_string[],
+                two_d_path.displayed_string[],
+                !no_3d_checkbox.checked[],
+                !no_2d_checkbox.checked[],
+            )
+            status_text[] = "Loading selected data..."
+            if wait_for_window
+                launch_config[] = config
+                !isnothing(screen_ref[]) && close(screen_ref[])
+            else
+                !isnothing(screen_ref[]) && close(screen_ref[])
+                @async begin
+                    try
+                        main(; config..., display_figure = true, wait_for_window = false)
+                    catch err
+                        Base.display_error(stderr, err, catch_backtrace())
+                    end
+                end
+            end
+        catch err
+            status_text[] = "Launch failed: $(sprint(showerror, err))"
+        end
+    end
+
+    on(launch_button.clicks) do _
+        request_launch!()
+    end
+
+    refresh_enabled_state!()
+    screen = display(fig)
+    screen_ref[] = screen
+    LAST_FIGURE[] = fig
+    LAST_SCREEN[] = screen
+
+    if wait_for_window
+        wait(screen)
+        if !isnothing(launch_config[])
+            config = launch_config[]
+            return main(; config..., display_figure = true, wait_for_window = true)
+        end
+    end
+
+    return fig
+end
+
 if isinteractive()
     @async begin
         try
-            main(wait_for_window = false)
+            launch_startup_gui(wait_for_window = false)
         catch err
             Base.display_error(stderr, err, catch_backtrace())
         end
     end
 elseif abspath(PROGRAM_FILE) == abspath(@__FILE__)
-    main(wait_for_window = true)
+    launch_startup_gui(wait_for_window = true)
 end
