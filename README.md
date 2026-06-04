@@ -1,7 +1,6 @@
-# VTK Visualization Tool
+# JExpresso Visualization Tool
 
-Interactive Julia/GLMakie tool for inspecting simulation output stored as VTK
-unstructured-grid files. It supports 3D time series, 2D slices/planes, multi-piece
+Interactive Julia tool for inspecting simulation output obtained from JExpresso. It supports 3D time series, 2D slices/planes, multi-piece
 `.pvtu` timesteps, and exports selected plots/data to PNG or NetCDF.
 
 ## Requirements
@@ -164,11 +163,3 @@ main(
 )
 ```
 
-## Notes
-
-- Point data is read from VTU point-data arrays.
-- Repeated points are handled during gridding by averaging scalar samples where
-  appropriate.
-- Velocity-stress views require the point-data fields `u`, `v`, and `w`.
-- The tool validates selected paths before launching and reports startup errors
-  in the launcher window.
