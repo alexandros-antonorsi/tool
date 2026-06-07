@@ -87,6 +87,34 @@ const TWO_D_AVERAGE_CONTROL_PANEL_HEIGHT = 4 * TWO_D_AVERAGE_ROW_HEIGHT + 3 * TW
 const TWO_D_TIME_AVERAGE_CONTROL_PANEL_HEIGHT = 3 * TWO_D_AVERAGE_ROW_HEIGHT + 3 * TWO_D_AVERAGE_ROW_GAP
 const LAST_FIGURE = Ref{Any}(nothing)
 const LAST_SCREEN = Ref{Any}(nothing)
+const HOT_DESATURATED_COLORMAP = cgrad([
+    RGBf(0.00, 0.00, 0.00),
+    RGBf(0.55, 0.05, 0.04),
+    RGBf(0.85, 0.30, 0.10),
+    RGBf(0.97, 0.72, 0.38),
+    RGBf(1.00, 0.96, 0.82),
+])
+const APP_COLORMAP_OPTIONS = Pair{String, Any}[
+    "Viridis" => cgrad(:viridis),
+    "Inferno" => cgrad(:inferno),
+    "Magma" => cgrad(:magma),
+    "Plasma" => cgrad(:plasma),
+    "Cividis" => cgrad(:cividis),
+    "Spectral" => cgrad(:Spectral),
+    "Blues" => cgrad(:Blues),
+    "Hot" => cgrad(:hot),
+    "Hot desaturated" => HOT_DESATURATED_COLORMAP,
+    "Turbo" => cgrad(:turbo),
+    "Thermal" => cgrad(:thermal),
+    "Balance" => cgrad(:balance),
+    "Batlow" => cgrad(:batlow),
+    "Dense" => cgrad(:dense),
+    "Gray" => cgrad(:grays),
+]
+const APP_COLORMAP_LABELS = first.(APP_COLORMAP_OPTIONS)
+const APP_COLORMAP_BY_LABEL = Dict(APP_COLORMAP_OPTIONS)
+
+colormap_for_label(label) = APP_COLORMAP_BY_LABEL[String(label)]
 
 struct SnapshotState
     time::Float64
@@ -866,9 +894,9 @@ function write_nc_attributes(io, attributes)
     end
 end
 
-function write_nc_header(io, dimensions, global_attributes, variables)
+function write_nc_header(io, dimensions, global_attributes, variables; record_count = 0)
     write(io, UInt8['C', 'D', 'F', 0x01])
-    write_nc_u32(io, 0)
+    write_nc_u32(io, record_count)
 
     write_nc_u32(io, NC_DIMENSION)
     write_nc_u32(io, length(dimensions))
@@ -939,8 +967,14 @@ end
 normalized_2d_netcdf_output_path(path) =
     normalized_netcdf_output_path(path; default_path = DEFAULT_2D_NETCDF_EXPORT_PATH)
 
+function is_netcdf_record_variable(dim_ids, dimensions)
+    isempty(dim_ids) && return false
+    return dimensions[first(dim_ids) + 1][2] == 0
+end
+
 function nc_variable_size(dim_ids, dimensions, nc_type)
-    value_count = prod(Int(dimensions[dim_id + 1][2]) for dim_id in dim_ids)
+    sized_dim_ids = is_netcdf_record_variable(dim_ids, dimensions) ? dim_ids[2:end] : dim_ids
+    value_count = prod(Int(dimensions[dim_id + 1][2]) for dim_id in sized_dim_ids; init = 1)
     return nc_padded_size(value_count * nc_type_size(nc_type))
 end
 
@@ -987,10 +1021,16 @@ end
 function with_netcdf_variable_offsets(dimensions, global_attributes, variables)
     scratch = IOBuffer()
     write_nc_header(scratch, dimensions, global_attributes, variables)
-    offset = position(scratch)
+    fixed_offset = position(scratch)
+    record_offset = fixed_offset + sum(
+        variable.vsize for variable in variables if !is_netcdf_record_variable(variable.dim_ids, dimensions);
+        init = 0,
+    )
 
     variables_with_offsets = NetCDFVariableSpec[]
     for variable in variables
+        is_record_variable = is_netcdf_record_variable(variable.dim_ids, dimensions)
+        offset = is_record_variable ? record_offset : fixed_offset
         push!(variables_with_offsets, NetCDFVariableSpec(
             variable.name,
             variable.dim_ids,
@@ -999,7 +1039,11 @@ function with_netcdf_variable_offsets(dimensions, global_attributes, variables)
             variable.vsize,
             offset,
         ))
-        offset += variable.vsize
+        if is_record_variable
+            record_offset += variable.vsize
+        else
+            fixed_offset += variable.vsize
+        end
     end
 
     return variables_with_offsets
@@ -1011,22 +1055,20 @@ function write_netcdf_coordinate_data(io, values)
     end
 end
 
-function write_netcdf_field_data(io, snapshot_series::SnapshotSeries, field_name, xgrid, ygrid, zgrid; round_digits = ROUND_DIGITS)
-    for snapshot in snapshot_series.snapshots
-        xgrid_i, ygrid_i, zgrid_i, volume, _ = point_values_to_masked_volume(
-            snapshot_series.x,
-            snapshot_series.y,
-            snapshot_series.z,
-            snapshot.fields[field_name];
-            round_digits = round_digits,
-        )
-        xgrid_i == xgrid || error("Export grid x coordinates changed while exporting $(field_name).")
-        ygrid_i == ygrid || error("Export grid y coordinates changed while exporting $(field_name).")
-        zgrid_i == zgrid || error("Export grid z coordinates changed while exporting $(field_name).")
+function write_netcdf_field_record_data(io, snapshot_series::SnapshotSeries, snapshot::SnapshotState, field_name, xgrid, ygrid, zgrid; round_digits = ROUND_DIGITS)
+    xgrid_i, ygrid_i, zgrid_i, volume, _ = point_values_to_masked_volume(
+        snapshot_series.x,
+        snapshot_series.y,
+        snapshot_series.z,
+        snapshot.fields[field_name];
+        round_digits = round_digits,
+    )
+    xgrid_i == xgrid || error("Export grid x coordinates changed while exporting $(field_name).")
+    ygrid_i == ygrid || error("Export grid y coordinates changed while exporting $(field_name).")
+    zgrid_i == zgrid || error("Export grid z coordinates changed while exporting $(field_name).")
 
-        for iz in eachindex(zgrid), iy in eachindex(ygrid), ix in eachindex(xgrid)
-            write_nc_f32(io, volume[ix, iy, iz])
-        end
+    for iz in eachindex(zgrid), iy in eachindex(ygrid), ix in eachindex(xgrid)
+        write_nc_f32(io, volume[ix, iy, iz])
     end
 end
 
@@ -1035,37 +1077,44 @@ function export_snapshot_series_to_netcdf(snapshot_series::SnapshotSeries, outpu
     isempty(field_names) && error("Cannot export NetCDF without point-data fields.")
 
     lookup = point_grid_lookup(snapshot_series.x, snapshot_series.y, snapshot_series.z; round_digits = round_digits)
-    dimensions = [
-        ("time", length(snapshot_series.snapshots)),
+    record_count = length(snapshot_series.snapshots)
+    header_dimensions = [
+        ("time", 0),
         ("x", length(lookup.xgrid)),
         ("y", length(lookup.ygrid)),
         ("z", length(lookup.zgrid)),
     ]
+    exported_dimensions = [
+        ("time", record_count),
+        header_dimensions[2:end]...,
+    ]
     global_attributes = Any[
         nc_attribute("source", snapshot_series.source_name),
         nc_attribute("created_by", "tool.jl"),
-        nc_attribute("conventions_note", "Scalar point data exported on regular time,z,y,x grid."),
+        nc_attribute("conventions_note", "Scalar point data exported on regular unlimited-time,z,y,x grid."),
     ]
-    variables, field_name_map = netcdf_variable_specs(dimensions, field_names)
-    variables = with_netcdf_variable_offsets(dimensions, global_attributes, variables)
+    variables, field_name_map = netcdf_variable_specs(header_dimensions, field_names)
+    variables = with_netcdf_variable_offsets(header_dimensions, global_attributes, variables)
 
     final_output_path = normalized_netcdf_output_path(output_path)
     mkpath(dirname(final_output_path))
     open(final_output_path, "w") do io
-        write_nc_header(io, dimensions, global_attributes, variables)
-        write_netcdf_coordinate_data(io, [snapshot.time for snapshot in snapshot_series.snapshots])
+        write_nc_header(io, header_dimensions, global_attributes, variables; record_count = record_count)
         write_netcdf_coordinate_data(io, lookup.xgrid)
         write_netcdf_coordinate_data(io, lookup.ygrid)
         write_netcdf_coordinate_data(io, lookup.zgrid)
-        for (field_name, _) in field_name_map
-            write_netcdf_field_data(io, snapshot_series, field_name, lookup.xgrid, lookup.ygrid, lookup.zgrid; round_digits = round_digits)
+        for snapshot in snapshot_series.snapshots
+            write_nc_f64(io, snapshot.time)
+            for (field_name, _) in field_name_map
+                write_netcdf_field_record_data(io, snapshot_series, snapshot, field_name, lookup.xgrid, lookup.ygrid, lookup.zgrid; round_digits = round_digits)
+            end
         end
     end
 
     return (
         path = final_output_path,
         fields = field_name_map,
-        dimensions = dimensions,
+        dimensions = exported_dimensions,
     )
 end
 
@@ -1147,20 +1196,18 @@ function two_d_netcdf_variable_specs(dimensions, field_names, axis_x_name, axis_
     return sized_variables, field_name_map
 end
 
-function write_two_d_netcdf_field_data(io, two_d_series::TwoDSnapshotSeries, field_name, axis_xgrid, axis_ygrid; round_digits = ROUND_DIGITS)
-    for snapshot in two_d_series.snapshots
-        axis_xgrid_i, axis_ygrid_i, grid, _ = two_d_point_values_to_masked_grid(
-            two_d_series.axis_x,
-            two_d_series.axis_y,
-            snapshot.fields[field_name];
-            round_digits = round_digits,
-        )
-        axis_xgrid_i == axis_xgrid || error("Export grid x coordinates changed while exporting $(field_name).")
-        axis_ygrid_i == axis_ygrid || error("Export grid y coordinates changed while exporting $(field_name).")
+function write_two_d_netcdf_field_record_data(io, two_d_series::TwoDSnapshotSeries, snapshot::SnapshotState, field_name, axis_xgrid, axis_ygrid; round_digits = ROUND_DIGITS)
+    axis_xgrid_i, axis_ygrid_i, grid, _ = two_d_point_values_to_masked_grid(
+        two_d_series.axis_x,
+        two_d_series.axis_y,
+        snapshot.fields[field_name];
+        round_digits = round_digits,
+    )
+    axis_xgrid_i == axis_xgrid || error("Export grid x coordinates changed while exporting $(field_name).")
+    axis_ygrid_i == axis_ygrid || error("Export grid y coordinates changed while exporting $(field_name).")
 
-        for axis_y_index in eachindex(axis_ygrid), axis_x_index in eachindex(axis_xgrid)
-            write_nc_f32(io, grid[axis_x_index, axis_y_index])
-        end
+    for axis_y_index in eachindex(axis_ygrid), axis_x_index in eachindex(axis_xgrid)
+        write_nc_f32(io, grid[axis_x_index, axis_y_index])
     end
 end
 
@@ -1172,35 +1219,42 @@ function export_two_d_snapshot_series_to_netcdf(two_d_series::TwoDSnapshotSeries
     axis_x_name = replace(two_d_series.axis_x_label, " (m)" => "")
     axis_y_name = replace(two_d_series.axis_y_label, " (m)" => "")
     axis_x_name == axis_y_name && error("2D NetCDF coordinate axes must have distinct names.")
-    dimensions = [
-        ("time", length(two_d_series.snapshots)),
+    record_count = length(two_d_series.snapshots)
+    header_dimensions = [
+        ("time", 0),
         (axis_x_name, length(lookup.axis_xgrid)),
         (axis_y_name, length(lookup.axis_ygrid)),
+    ]
+    exported_dimensions = [
+        ("time", record_count),
+        header_dimensions[2:end]...,
     ]
     global_attributes = Any[
         nc_attribute("source", two_d_series.source_name),
         nc_attribute("created_by", "tool.jl"),
-        nc_attribute("conventions_note", "Scalar point data exported on regular time,$(axis_y_name),$(axis_x_name) grid."),
+        nc_attribute("conventions_note", "Scalar point data exported on regular unlimited-time,$(axis_y_name),$(axis_x_name) grid."),
     ]
-    variables, field_name_map = two_d_netcdf_variable_specs(dimensions, field_names, axis_x_name, axis_y_name)
-    variables = with_netcdf_variable_offsets(dimensions, global_attributes, variables)
+    variables, field_name_map = two_d_netcdf_variable_specs(header_dimensions, field_names, axis_x_name, axis_y_name)
+    variables = with_netcdf_variable_offsets(header_dimensions, global_attributes, variables)
 
     final_output_path = normalized_2d_netcdf_output_path(output_path)
     mkpath(dirname(final_output_path))
     open(final_output_path, "w") do io
-        write_nc_header(io, dimensions, global_attributes, variables)
-        write_netcdf_coordinate_data(io, [snapshot.time for snapshot in two_d_series.snapshots])
+        write_nc_header(io, header_dimensions, global_attributes, variables; record_count = record_count)
         write_netcdf_coordinate_data(io, lookup.axis_xgrid)
         write_netcdf_coordinate_data(io, lookup.axis_ygrid)
-        for (field_name, _) in field_name_map
-            write_two_d_netcdf_field_data(io, two_d_series, field_name, lookup.axis_xgrid, lookup.axis_ygrid; round_digits = round_digits)
+        for snapshot in two_d_series.snapshots
+            write_nc_f64(io, snapshot.time)
+            for (field_name, _) in field_name_map
+                write_two_d_netcdf_field_record_data(io, two_d_series, snapshot, field_name, lookup.axis_xgrid, lookup.axis_ygrid; round_digits = round_digits)
+            end
         end
     end
 
     return (
         path = final_output_path,
         fields = field_name_map,
-        dimensions = dimensions,
+        dimensions = exported_dimensions,
     )
 end
 
@@ -1250,6 +1304,7 @@ end
 function save_plot_figure_to_png(fig, output_dir; prefix = "plot", px_per_unit = SNAPSHOT_PNG_PX_PER_UNIT)
     final_output_dir = normpath(String(output_dir))
     output_path = next_png_snapshot_path(final_output_dir, prefix)
+    Makie.update_state_before_display!(fig)
     export_screen = GLMakie.Screen(
         visible = false,
         start_renderloop = false,
@@ -1257,9 +1312,9 @@ function save_plot_figure_to_png(fig, output_dir; prefix = "plot", px_per_unit =
     )
     try
         display(export_screen, fig)
-        save(output_path, Makie.colorbuffer(export_screen; figure = fig))
+        save(output_path, copy(Makie.colorbuffer(export_screen; figure = fig)))
     finally
-        close(export_screen)
+        close(export_screen; reuse = false)
     end
     return (
         dir = final_output_dir,
@@ -2809,6 +2864,7 @@ function main(;
     y_value = Observable(Float64(default_slice_data.y0))
     z_value = Observable(Float64(default_slice_data.z0))
     slice_plane = Observable(:xy)
+    selected_slice_colormap_label = Observable("Viridis")
 
     ax_slice = Axis(
         slice_panel[1, 1],
@@ -2847,8 +2903,8 @@ function main(;
     slice_data = lift(slice_plane, selected_slice_data, x_value, y_value, z_value) do plane, slice_data, xv, yv, zv
         volume_slice(slice_data.plotted_volume, plane, slice_data.xgrid, slice_data.ygrid, slice_data.zgrid, xv, yv, zv)
     end
-    slice_colormap = lift(selected_slice_data) do slice_data
-        slice_data.colormap
+    slice_colormap = lift(selected_slice_colormap_label) do label
+        colormap_for_label(label)
     end
     slice_colorrange = lift(selected_slice_data) do slice_data
         slice_data.colorrange
@@ -2887,6 +2943,7 @@ function main(;
     prime_y_value = Observable(Float64(default_prime_data.y0))
     prime_z_value = Observable(Float64(default_prime_data.z0))
     prime_slice_plane = Observable(:xy)
+    selected_prime_colormap_label = Observable("Balance")
 
     prime_slice_xcoords = lift(prime_slice_plane, selected_prime_data) do plane, prime_data
         plane == :yz ? prime_data.ygrid : prime_data.xgrid
@@ -2899,6 +2956,9 @@ function main(;
     end
     prime_colorrange = lift(selected_prime_field) do field_name
         get_prime_colorrange(field_name)
+    end
+    prime_colormap = lift(selected_prime_colormap_label) do label
+        colormap_for_label(label)
     end
 
     ax_prime = Axis(
@@ -2928,7 +2988,7 @@ function main(;
         prime_slice_xcoords,
         prime_slice_ycoords,
         prime_slice_data;
-        colormap = :balance,
+        colormap = prime_colormap,
         colorrange = prime_colorrange,
         nan_color = RGBAf(0, 0, 0, 0),
     )
@@ -2950,6 +3010,7 @@ function main(;
     selected_average_profile_field = Observable(default_average_profile_field_name)
     average_profile_direction = Observable(default_average_profile_direction)
     selected_average_profile_data = Observable(default_average_profile_data)
+    selected_average_profile_colormap_label = Observable("Viridis")
 
     average_profile_xcoords = lift(selected_average_profile_data) do average_profile_data
         average_profile_data.xcoords
@@ -2960,8 +3021,8 @@ function main(;
     average_profile_matrix = lift(selected_average_profile_data) do average_profile_data
         average_profile_data.profile
     end
-    average_profile_colormap = lift(selected_average_profile_data) do average_profile_data
-        average_profile_data.colormap
+    average_profile_colormap = lift(selected_average_profile_colormap_label) do label
+        colormap_for_label(label)
     end
     average_profile_colorrange = lift(selected_average_profile_data) do average_profile_data
         average_profile_data.colorrange
@@ -3023,11 +3084,12 @@ function main(;
     selected_2d_field = Observable(default_2d_field_name)
     two_d_snapshot_index = Observable(default_2d_snapshot_index)
     selected_2d_snapshot = Observable(default_2d_snapshot)
+    selected_2d_colormap_label = Observable("Viridis")
     two_d_plot_values = lift(selected_2d_snapshot, selected_2d_field) do snapshot, field_name
         snapshot.fields[field_name]
     end
-    two_d_colormap = lift(selected_2d_field) do field_name
-        two_d_field_style_by_field[field_name][1]
+    two_d_colormap = lift(selected_2d_colormap_label) do label
+        colormap_for_label(label)
     end
     two_d_colorrange = lift(selected_2d_field) do field_name
         two_d_field_style_by_field[field_name][2]
@@ -3092,11 +3154,15 @@ function main(;
     two_d_average_direction = Observable(default_2d_average_direction)
     two_d_average_mode = Observable(:prime)
     selected_2d_average_data = Observable(default_2d_average_data)
+    selected_2d_average_colormap_label = Observable("Balance")
     two_d_average_prime_values = lift(selected_2d_average_data, two_d_average_snapshot_index) do average_data, snapshot_index
         average_data.prime_values_by_snapshot[snapshot_index]
     end
     two_d_average_prime_colorrange = lift(selected_2d_average_data) do average_data
         average_data.prime_colorrange
+    end
+    two_d_average_prime_colormap = lift(selected_2d_average_colormap_label) do label
+        colormap_for_label(label)
     end
     two_d_average_profile_coordinates = lift(selected_2d_average_data) do average_data
         average_data.profile_coordinates
@@ -3132,7 +3198,7 @@ function main(;
         two_d_series.points,
         two_d_series.faces;
         color = two_d_average_prime_values,
-        colormap = :balance,
+        colormap = two_d_average_prime_colormap,
         colorrange = two_d_average_prime_colorrange,
         shading = NoShading,
     )
@@ -3261,6 +3327,14 @@ function main(;
         width = 360,
         direction = :down,
     )
+    slice_colormap_caption = Label(slice_controls[1, 3], "Color scale:", color = APP_TEXT_COLOR, halign = :right)
+    slice_colormap_menu = Menu(
+        slice_controls[1, 4],
+        options = APP_COLORMAP_LABELS,
+        default = selected_slice_colormap_label[],
+        width = 190,
+        direction = :down,
+    )
 
     slice_time_caption = Label(slice_controls[2, 1], "Time step:", color = APP_TEXT_COLOR, halign = :right)
     slice_time_row = GridLayout(slice_controls[2, 2]; tellwidth = false, halign = :left)
@@ -3325,6 +3399,14 @@ function main(;
         options = prime_field_names,
         default = default_prime_field_name,
         width = 360,
+        direction = :down,
+    )
+    prime_colormap_caption = Label(prime_controls[1, 3], "Color scale:", color = APP_TEXT_COLOR, halign = :right)
+    prime_colormap_menu = Menu(
+        prime_controls[1, 4],
+        options = APP_COLORMAP_LABELS,
+        default = selected_prime_colormap_label[],
+        width = 190,
         direction = :down,
     )
     prime_time_caption = Label(prime_controls[2, 1], "Time step:", color = APP_TEXT_COLOR, halign = :right)
@@ -3392,6 +3474,14 @@ function main(;
         width = 360,
         direction = :down,
     )
+    average_profile_colormap_caption = Label(average_profile_controls[1, 3], "Color scale:", color = APP_TEXT_COLOR, halign = :right)
+    average_profile_colormap_menu = Menu(
+        average_profile_controls[1, 4],
+        options = APP_COLORMAP_LABELS,
+        default = selected_average_profile_colormap_label[],
+        width = 190,
+        direction = :down,
+    )
     average_profile_direction_caption = Label(average_profile_controls[2, 1], "Mean plane:", color = APP_TEXT_COLOR, halign = :right)
     average_profile_direction_buttons = GridLayout(average_profile_controls[2, 2]; tellwidth = false, halign = :left)
     colgap!(average_profile_direction_buttons, 10)
@@ -3412,6 +3502,14 @@ function main(;
         options = two_d_series.field_names,
         default = default_2d_field_name,
         width = 360,
+        direction = :down,
+    )
+    two_d_colormap_caption = Label(two_d_controls[1, 3], "Color scale:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_colormap_menu = Menu(
+        two_d_controls[1, 4],
+        options = APP_COLORMAP_LABELS,
+        default = selected_2d_colormap_label[],
+        width = 190,
         direction = :down,
     )
     two_d_time_caption = Label(two_d_controls[2, 1], "2D file:", color = APP_TEXT_COLOR, halign = :right)
@@ -3439,6 +3537,14 @@ function main(;
         options = two_d_series.field_names,
         default = default_2d_field_name,
         width = 360,
+        direction = :down,
+    )
+    two_d_average_colormap_caption = Label(two_d_average_controls[1, 3], "Color scale:", color = APP_TEXT_COLOR, halign = :right)
+    two_d_average_colormap_menu = Menu(
+        two_d_average_controls[1, 4],
+        options = APP_COLORMAP_LABELS,
+        default = selected_2d_average_colormap_label[],
+        width = 190,
         direction = :down,
     )
     two_d_average_mode_caption = Label(two_d_average_controls[2, 1], "Quantity:", color = APP_TEXT_COLOR, halign = :right)
@@ -3521,7 +3627,19 @@ function main(;
     png_export_running = Observable(false)
     rowsize!(exports_panel, 3, Fixed(96))
 
-    dropdown_menus = (cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu, two_d_average_field_menu)
+    dropdown_menus = (
+        cloud_speed_menu,
+        slice_field_menu,
+        slice_colormap_menu,
+        prime_field_menu,
+        prime_colormap_menu,
+        average_profile_field_menu,
+        average_profile_colormap_menu,
+        two_d_field_menu,
+        two_d_colormap_menu,
+        two_d_average_field_menu,
+        two_d_average_colormap_menu,
+    )
 
     function close_menu!(menu)
         menu.is_open[] = false
@@ -3551,6 +3669,7 @@ function main(;
         exports_title,
         exports_status,
         slice_field_caption,
+        slice_colormap_caption,
         slice_time_caption,
         slice_time_text,
         plane_caption,
@@ -3562,6 +3681,7 @@ function main(;
         y_text,
         slice_info,
         prime_field_caption,
+        prime_colormap_caption,
         prime_time_caption,
         prime_time_text,
         prime_formula,
@@ -3574,10 +3694,12 @@ function main(;
         prime_y_text,
         prime_info,
         average_profile_field_caption,
+        average_profile_colormap_caption,
         average_profile_direction_caption,
         average_profile_info,
         two_d_note,
         two_d_field_caption,
+        two_d_colormap_caption,
         two_d_time_caption,
         two_d_time_text,
         two_d_exports_title,
@@ -3586,6 +3708,7 @@ function main(;
         two_d_export_status,
         two_d_average_note,
         two_d_average_field_caption,
+        two_d_average_colormap_caption,
         two_d_average_mode_caption,
         two_d_average_direction_caption,
         two_d_average_time_caption,
@@ -3624,7 +3747,19 @@ function main(;
         export_button,
         png_export_button,
     ]
-    app_menus = Any[cloud_speed_menu, slice_field_menu, prime_field_menu, average_profile_field_menu, two_d_field_menu, two_d_average_field_menu]
+    app_menus = Any[
+        cloud_speed_menu,
+        slice_field_menu,
+        slice_colormap_menu,
+        prime_field_menu,
+        prime_colormap_menu,
+        average_profile_field_menu,
+        average_profile_colormap_menu,
+        two_d_field_menu,
+        two_d_colormap_menu,
+        two_d_average_field_menu,
+        two_d_average_colormap_menu,
+    ]
     app_textboxes = Any[export_path_textbox, png_export_path_textbox, two_d_netcdf_export_path_textbox, two_d_export_path_textbox]
     app_checkboxes = Any[dark_mode_checkbox, values(render_checkbox_by_field)...]
 
@@ -3887,6 +4022,11 @@ function main(;
         set_close_to!(z_slider, slice_data.z0)
         set_slice_plane!(slice_plane[])
     end
+    on(slice_colormap_menu.selection) do label
+        isnothing(label) && return
+        close_menu!(slice_colormap_menu)
+        selected_slice_colormap_label[] = String(label)
+    end
 
     on(prime_z_slider.value) do v
         prime_z_value[] = Float64(v)
@@ -3920,6 +4060,11 @@ function main(;
         set_close_to!(prime_z_slider, prime_data.z0)
         set_prime_slice_plane!(prime_slice_plane[])
     end
+    on(prime_colormap_menu.selection) do label
+        isnothing(label) && return
+        close_menu!(prime_colormap_menu)
+        selected_prime_colormap_label[] = String(label)
+    end
     function set_cloud_controls_visibility!(show_controls::Bool)
         show_controls || close_menu!(cloud_speed_menu)
         update_render_visibility!()
@@ -3939,13 +4084,18 @@ function main(;
     end
 
     function set_slice_controls_visibility!(show_controls::Bool)
-        show_controls || close_menu!(slice_field_menu)
+        if !show_controls
+            close_menu!(slice_field_menu)
+            close_menu!(slice_colormap_menu)
+        end
         is_xy = show_controls && slice_plane[] == :xy
         is_yz = show_controls && slice_plane[] == :yz
         is_xz = show_controls && slice_plane[] == :xz
 
         slice_field_caption.visible[] = show_controls
         slice_field_menu.blockscene.visible[] = show_controls
+        slice_colormap_caption.visible[] = show_controls
+        slice_colormap_menu.blockscene.visible[] = show_controls
         slice_time_caption.visible[] = show_controls
         slice_time_slider.blockscene.visible[] = show_controls
         slice_time_text.visible[] = show_controls
@@ -3975,13 +4125,18 @@ function main(;
     end
 
     function set_prime_controls_visibility!(show_controls::Bool)
-        show_controls || close_menu!(prime_field_menu)
+        if !show_controls
+            close_menu!(prime_field_menu)
+            close_menu!(prime_colormap_menu)
+        end
         is_xy = show_controls && prime_slice_plane[] == :xy
         is_yz = show_controls && prime_slice_plane[] == :yz
         is_xz = show_controls && prime_slice_plane[] == :xz
 
         prime_field_caption.visible[] = show_controls
         prime_field_menu.blockscene.visible[] = show_controls
+        prime_colormap_caption.visible[] = show_controls
+        prime_colormap_menu.blockscene.visible[] = show_controls
         prime_time_caption.visible[] = show_controls
         prime_time_slider.blockscene.visible[] = show_controls
         prime_time_text.visible[] = show_controls
@@ -4013,9 +4168,14 @@ function main(;
     end
 
     function set_average_profile_controls_visibility!(show_controls::Bool)
-        show_controls || close_menu!(average_profile_field_menu)
+        if !show_controls
+            close_menu!(average_profile_field_menu)
+            close_menu!(average_profile_colormap_menu)
+        end
         average_profile_field_caption.visible[] = show_controls
         average_profile_field_menu.blockscene.visible[] = show_controls
+        average_profile_colormap_caption.visible[] = show_controls
+        average_profile_colormap_menu.blockscene.visible[] = show_controls
         average_profile_direction_caption.visible[] = show_controls
         btn_average_x.blockscene.visible[] = show_controls
         btn_average_y.blockscene.visible[] = show_controls
@@ -4028,9 +4188,14 @@ function main(;
     end
 
     function set_2d_controls_visibility!(show_controls::Bool)
-        show_controls || close_menu!(two_d_field_menu)
+        if !show_controls
+            close_menu!(two_d_field_menu)
+            close_menu!(two_d_colormap_menu)
+        end
         two_d_field_caption.visible[] = show_controls
         two_d_field_menu.blockscene.visible[] = show_controls
+        two_d_colormap_caption.visible[] = show_controls
+        two_d_colormap_menu.blockscene.visible[] = show_controls
         two_d_time_caption.visible[] = show_controls
         two_d_time_slider.blockscene.visible[] = show_controls
         two_d_time_text.visible[] = show_controls
@@ -4041,11 +4206,18 @@ function main(;
     end
 
     function set_2d_average_controls_visibility!(show_controls::Bool)
-        show_controls || close_menu!(two_d_average_field_menu)
+        if !show_controls
+            close_menu!(two_d_average_field_menu)
+            close_menu!(two_d_average_colormap_menu)
+        end
         show_file = show_controls && two_d_average_mode[] == :prime
+        show_colormap = show_controls && two_d_average_mode[] == :prime
+        show_colormap || close_menu!(two_d_average_colormap_menu)
 
         two_d_average_field_caption.visible[] = show_controls
         two_d_average_field_menu.blockscene.visible[] = show_controls
+        two_d_average_colormap_caption.visible[] = show_colormap
+        two_d_average_colormap_menu.blockscene.visible[] = show_colormap
         two_d_average_mode_caption.visible[] = show_controls
         btn_2d_average_prime.blockscene.visible[] = show_controls
         btn_2d_average_time_mean.blockscene.visible[] = show_controls
@@ -4438,7 +4610,7 @@ function main(;
                 xlabel = slice_xlabel,
                 ylabel = slice_ylabel,
                 colorbar_label = slice_field_name,
-                colormap = slice_state.colormap,
+                colormap = colormap_for_label(selected_slice_colormap_label[]),
                 colorrange = slice_state.colorrange,
             );
             prefix = "3d_slice_$(slice_plane_value)_$(plot_file_component(slice_field_name))_t$(number_file_component(slice_state.time))_$(slice_fixed_axis)$(number_file_component(slice_fixed_value))",
@@ -4473,7 +4645,7 @@ function main(;
                 xlabel = prime_xlabel,
                 ylabel = prime_ylabel,
                 colorbar_label = prime_field_label(prime_field_name),
-                colormap = :balance,
+                colormap = colormap_for_label(selected_prime_colormap_label[]),
                 colorrange = get_prime_colorrange(prime_field_name),
             );
             prefix = "3d_prime_$(prime_plane_value)_$(plot_file_component(prime_field_name))_t$(number_file_component(prime_time))_$(prime_fixed_axis)$(number_file_component(prime_fixed_value))",
@@ -4494,7 +4666,7 @@ function main(;
                 xlabel = average_xlabel,
                 ylabel = average_ylabel,
                 colorbar_label = average_profile_label(average_field_name, average_direction_value),
-                colormap = average_state.colormap,
+                colormap = colormap_for_label(selected_average_profile_colormap_label[]),
                 colorrange = average_state.colorrange,
             );
             prefix = "3d_mean_profile_$(plot_file_component(average_field_name))_avg_$(average_direction_value)",
@@ -4518,7 +4690,7 @@ function main(;
 
         two_d_field_name = selected_2d_field[]
         two_d_snapshot = selected_2d_snapshot[]
-        two_d_colormap_value, two_d_colorrange_value = two_d_field_style_by_field[two_d_field_name]
+        _, two_d_colorrange_value = two_d_field_style_by_field[two_d_field_name]
         save_export_plot!(
             paths,
             output_dir,
@@ -4526,7 +4698,7 @@ function main(;
                 two_d_series,
                 two_d_snapshot,
                 two_d_field_name;
-                colormap = two_d_colormap_value,
+                colormap = colormap_for_label(selected_2d_colormap_label[]),
                 colorrange = two_d_colorrange_value,
             );
             prefix = "2d_data_$(plot_file_component(two_d_snapshot.label))_$(plot_file_component(two_d_field_name))",
@@ -4545,7 +4717,7 @@ function main(;
                 values = average_state.prime_values_by_snapshot[two_d_average_snapshot_index[]],
                 title = two_d_prime_title(two_d_series, average_field_name, average_snapshot, average_direction_value),
                 colorbar_label = prime_field_label(average_field_name),
-                colormap = :balance,
+                colormap = colormap_for_label(selected_2d_average_colormap_label[]),
                 colorrange = average_state.prime_colorrange,
             )
             average_prefix = "2d_average_prime_$(plot_file_component(average_axis))_avg_$(plot_file_component(average_snapshot.label))_$(plot_file_component(average_field_name))"
@@ -4572,15 +4744,17 @@ function main(;
         button.label[] = "Exporting..."
         status_text[] = "Exporting..."
 
-        try
-            output_dir = normalize_output_dir(path_textbox.displayed_string[])
-            result = export_plots(output_dir)
-            status_text[] = "Export complete: $(length(result.paths)) PNGs in $(result.dir)"
-        catch err
-            status_text[] = "Export failed: $(sprint(showerror, err))"
-        finally
-            button.label[] = "Export PNGs"
-            running[] = false
+        @async begin
+            try
+                output_dir = normalize_output_dir(path_textbox.displayed_string[])
+                result = export_plots(output_dir)
+                status_text[] = "Export complete: $(length(result.paths)) PNGs in $(result.dir)"
+            catch err
+                status_text[] = "Export failed: $(sprint(showerror, err))"
+            finally
+                button.label[] = "Export PNGs"
+                running[] = false
+            end
         end
     end
 
@@ -4642,6 +4816,11 @@ function main(;
         close_menu!(average_profile_field_menu)
         set_average_profile_field!(field_name)
     end
+    on(average_profile_colormap_menu.selection) do label
+        isnothing(label) && return
+        close_menu!(average_profile_colormap_menu)
+        selected_average_profile_colormap_label[] = String(label)
+    end
 
     on(two_d_time_slider.value) do v
         idx = Int(v) + 1
@@ -4655,6 +4834,11 @@ function main(;
         close_menu!(two_d_field_menu)
         set_2d_field!(field_name)
     end
+    on(two_d_colormap_menu.selection) do label
+        isnothing(label) && return
+        close_menu!(two_d_colormap_menu)
+        selected_2d_colormap_label[] = String(label)
+    end
 
     on(two_d_average_time_slider.value) do v
         two_d_average_snapshot_index[] = Int(v) + 1
@@ -4665,6 +4849,11 @@ function main(;
         isnothing(field_name) && return
         close_menu!(two_d_average_field_menu)
         set_2d_average_field!(field_name)
+    end
+    on(two_d_average_colormap_menu.selection) do label
+        isnothing(label) && return
+        close_menu!(two_d_average_colormap_menu)
+        selected_2d_average_colormap_label[] = String(label)
     end
 
     on(two_d_export_button.clicks) do _
